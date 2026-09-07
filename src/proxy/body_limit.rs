@@ -4,6 +4,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -50,6 +51,7 @@ impl<B> LimitedBody<B> {
 impl<B> Body for LimitedBody<B>
 where
     B: Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
 {
     type Data = Bytes;
     type Error = BodyLimitError;
@@ -156,7 +158,7 @@ where
     }
 }
 
-/// Adapt any Body into BodyLimitError.
+// Adapt any Body into BodyLimitError.
 pin_project! {
     pub struct MapErrBody<B> {
         #[pin]

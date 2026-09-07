@@ -1,6 +1,7 @@
 //! TLS helpers for OxiGate termination.
 
 use anyhow::{Context, Result};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::fs::File;
@@ -13,31 +14,34 @@ pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerC
     let cert_file = File::open(cert_path)
         .with_context(|| format!("failed to open TLS cert: {cert_path}"))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let cert_chain = certs(&mut cert_reader)
-        .context("failed to parse TLS certificate chain")?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .context("failed to parse TLS certificate chain")?;
 
     let key_file =
         File::open(key_path).with_context(|| format!("failed to open TLS key: {key_path}"))?;
     let mut key_reader = BufReader::new(key_file);
 
-    // Try PKCS#8 first, then RSA
-    let mut keys = pkcs8_private_keys(&mut key_reader)
-        .context("failed to parse PKCS#8 private key")?;
-    if keys.is_empty() {
+    // Try PKCS#8 first, then RSA.
+    let key: PrivateKeyDer<'static> = if let Some(key) = pkcs8_private_keys(&mut key_reader)
+        .next()
+        .transpose()
+        .context("failed to parse PKCS#8 private key")?
+    {
+        key.into()
+    } else {
         let key_file = File::open(key_path)?;
         let mut key_reader = BufReader::new(key_file);
-        keys = rsa_private_keys(&mut key_reader).context("failed to parse RSA private key")?;
-    }
-    if keys.is_empty() {
-        anyhow::bail!("no private keys found in {key_path}");
-    }
-    let key = rustls::PrivateKey(keys.remove(0));
+        let rsa_key = rsa_private_keys(&mut key_reader)
+            .next()
+            .transpose()
+            .context("failed to parse RSA private key")?;
+        rsa_key
+            .map(Into::into)
+            .ok_or_else(|| anyhow::anyhow!("no private keys found in {key_path}"))?
+    };
 
     let mut config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
         .context("failed to build rustls ServerConfig")?;

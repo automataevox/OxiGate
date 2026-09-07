@@ -186,6 +186,7 @@ pub async fn proxy_request(
             remote_addr,
             &ctx.headers,
             ctx.request_timeout,
+            ctx.idle_timeout,
             ctx.client_is_tls,
             false,
         )

@@ -57,8 +57,13 @@ impl RateLimiter {
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let cost = self.emission;
-        // Burst allows TAT to lag behind by burst * emission
-        let max_credit = self.emission.mul_f64(self.cfg.burst);
+        // Burst is a multiplier of the configured rate. The first request
+        // consumes the current slot, so tolerance covers the remaining
+        // requests in the burst.
+        let burst_requests = self.cfg.rate as f64 * self.cfg.burst;
+        let max_credit = self
+            .emission
+            .mul_f64((burst_requests - 1.0).max(0.0));
 
         let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket { tat: now });
 

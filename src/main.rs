@@ -132,11 +132,15 @@ async fn main() -> anyhow::Result<()> {
     // Health runtime (client + config + lbs fully refreshable)
     let health_rt = {
         let runtime = runtime.clone();
-        let rt = runtime.read().unwrap();
+        let (client, config) = {
+            let rt = runtime.read().unwrap();
+            (rt.client.clone(), rt.config.health_check.clone())
+        };
+        let provider_runtime = runtime.clone();
         Arc::new(RwLock::new(HealthRuntime {
-            client: rt.client.clone(),
-            config: rt.config.health_check.clone(),
-            lbs: Box::new(move || runtime.read().unwrap().router.all_lbs()),
+            client,
+            config,
+            lbs: Box::new(move || provider_runtime.read().unwrap().router.all_lbs()),
         }))
     };
     {

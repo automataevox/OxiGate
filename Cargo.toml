@@ -23,11 +23,11 @@ http = "1"
 bytes = "1"
 
 # TLS termination (versions compatible with Rust 1.75)
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-tokio-rustls = "0.24"
-rustls-pemfile = "1.0"
-webpki-roots = "0.25"
-hyper-rustls = { version = "0.24", features = ["http1", "http2", "native-tokio", "tls12"] }
+rustls = { version = "0.23", features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+webpki-roots = "0.26"
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "tls12"] }
 
 
 # Lock-free config swap
