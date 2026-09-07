@@ -65,7 +65,7 @@ security_headers: true
 
 
 # Protect dashboard/metrics (recommended in production)
-admin_token: "changeme"
+admin_token: ""
 
 # When proxy_protocol: true, only accept PROXY headers from these CIDRs
 # proxy_protocol_trusted_cidrs:
