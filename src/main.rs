@@ -422,6 +422,7 @@ async fn run_admin_server(
                     let _ = hyper::server::conn::http1::Builder::new()
                         .keep_alive(true)
                         .serve_connection(io, service)
+                        .with_upgrades()
                         .await;
                 });
             }
