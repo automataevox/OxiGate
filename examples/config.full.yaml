@@ -1,0 +1,64 @@
+listen: "0.0.0.0:8080"
+metrics_listen: "0.0.0.0:9090"
+
+# tls:
+#   cert: "certs/server.crt"
+#   key: "certs/server.key"
+
+upstreams:
+  - address: "http://127.0.0.1:8081"
+    weight: 1
+  - address: "http://127.0.0.1:8082"
+    weight: 1
+  - address: "http://127.0.0.1:8083"
+    weight: 2
+
+load_balancing: power_of_two_choices
+retries: 2
+max_connections: 10000
+
+# GCRA rate limit per client IP
+rate_limit:
+  rps: 1000
+  burst: 1.5
+
+# Set true only when fronted by L4 LB sending PROXY protocol
+proxy_protocol: false
+
+# Prefer HTTP/2 to upstreams when available
+upstream_http2: true
+pool_max_idle_per_host: 64
+
+sticky:
+  cookie_name: OXIGATE
+  max_age_secs: 3600
+
+headers:
+  request_set:
+    X-Proxy: oxigate
+  response_set:
+    X-Served-By: oxigate
+
+access_log: true
+
+health_check:
+  interval_secs: 5
+  path: "/"
+
+timeouts:
+  connect_secs: 3
+  request_secs: 30
+  idle_secs: 60
+
+
+# Body / retry policy
+max_body_bytes: 16777216
+retry_idempotent_only: true
+force_retry_with_body: false
+
+# Security
+security_headers: true
+# acl:
+#   allow:
+#     - "10.0.0.0/8"
+#   deny: []
