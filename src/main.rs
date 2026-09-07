@@ -96,6 +96,10 @@ impl Runtime {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install the Rustls ring crypto provider"))?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
