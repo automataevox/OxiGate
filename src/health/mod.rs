@@ -5,30 +5,39 @@ use crate::proxy::client::{boxed_body, HttpClient};
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
-/// Tracks consecutive successes/failures per upstream address.
 struct ThresholdState {
     fails: u32,
     successes: u32,
 }
 
+/// Reloadable health inputs (updated on SIGHUP).
+pub struct HealthRuntime {
+    pub client: HttpClient,
+    pub config: HealthCheckConfig,
+    pub lbs: Box<dyn Fn() -> Vec<Arc<LoadBalancer>> + Send + Sync>,
+}
+
 pub async fn run_health_checks(
-    lbs_provider: Arc<dyn Fn() -> Vec<Arc<LoadBalancer>> + Send + Sync>,
-    client: HttpClient,
+    shared: Arc<RwLock<HealthRuntime>>,
     metrics: Arc<Metrics>,
-    health_cfg: HealthCheckConfig,
 ) {
-    let interval = Duration::from_secs(health_cfg.interval_secs.max(1));
-    let timeout = Duration::from_secs(health_cfg.timeout_secs.max(1));
-    let path = health_cfg.path.clone();
     let mut state: HashMap<String, ThresholdState> = HashMap::new();
 
     loop {
-        let lbs = lbs_provider();
+        let (client, health_cfg, lbs) = {
+            let g = shared.read().unwrap();
+            (g.client.clone(), g.config.clone(), (g.lbs)())
+        };
+
+        let interval = Duration::from_secs(health_cfg.interval_secs.max(1));
+        let timeout = Duration::from_secs(health_cfg.timeout_secs.max(1));
+        let path = health_cfg.path.clone();
+
         for lb in &lbs {
             for upstream in lb.upstreams() {
                 let healthy_now = check_one(&client, upstream, &path, timeout).await;

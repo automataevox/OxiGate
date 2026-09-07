@@ -655,6 +655,7 @@ dependencies = [
  "futures",
  "futures-util",
  "http 1.5.0",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper 1.11.1",
  "hyper-rustls",

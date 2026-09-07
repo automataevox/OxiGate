@@ -1,4 +1,4 @@
-//! Streaming body with a hard size limit (does not buffer the entire payload first).
+//! Streaming body helpers: size limit + per-frame idle timeout.
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -6,18 +6,22 @@ use hyper::body::{Body, Frame};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::{sleep, Instant, Sleep};
 
 #[derive(Debug)]
 pub enum BodyLimitError {
     TooLarge,
-    Hyper(hyper::Error),
+    IdleTimeout,
+    Other(String),
 }
 
 impl std::fmt::Display for BodyLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooLarge => write!(f, "body too large"),
-            Self::Hyper(e) => write!(f, "{e}"),
+            Self::IdleTimeout => write!(f, "body idle timeout"),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -46,7 +50,6 @@ impl<B> LimitedBody<B> {
 impl<B> Body for LimitedBody<B>
 where
     B: Body<Data = Bytes>,
-    B::Error: Into<hyper::Error>,
 {
     type Data = Bytes;
     type Error = BodyLimitError;
@@ -66,7 +69,9 @@ where
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BodyLimitError::Hyper(e.into())))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(BodyLimitError::Other(e.to_string()))))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -81,15 +86,145 @@ where
     }
 }
 
-/// Collect body with streaming size enforcement.
-pub async fn collect_limited<B>(body: B, max: usize) -> Result<Bytes, BodyLimitError>
+pin_project! {
+    /// Fails if no body frame arrives within `idle`.
+    pub struct IdleBody<B> {
+        #[pin]
+        inner: B,
+        #[pin]
+        delay: Sleep,
+        idle: Duration,
+    }
+}
+
+impl<B> IdleBody<B> {
+    pub fn new(inner: B, idle: Duration) -> Self {
+        let idle = idle.max(Duration::from_millis(50));
+        Self {
+            inner,
+            delay: sleep(idle),
+            idle,
+        }
+    }
+
+    fn reset_timer(self: Pin<&mut Self>) {
+        let idle = self.idle;
+        let mut this = self.project();
+        this.delay.as_mut().reset(Instant::now() + idle);
+    }
+}
+
+impl<B> Body for IdleBody<B>
+where
+    B: Body<Data = Bytes, Error = BodyLimitError>,
+{
+    type Data = Bytes;
+    type Error = BodyLimitError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let poll = {
+            let mut this = self.as_mut().project();
+            this.inner.as_mut().poll_frame(cx)
+        };
+
+        match poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                self.as_mut().reset_timer();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                let mut this = self.as_mut().project();
+                match this.delay.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(BodyLimitError::IdleTimeout))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Adapt any Body into BodyLimitError.
+pin_project! {
+    pub struct MapErrBody<B> {
+        #[pin]
+        inner: B,
+    }
+}
+
+impl<B> MapErrBody<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner }
+    }
+}
+
+impl<B> Body for MapErrBody<B>
 where
     B: Body<Data = Bytes>,
-    B::Error: Into<hyper::Error>,
+    B::Error: std::fmt::Display,
 {
-    let limited = LimitedBody::new(body, max);
-    match limited.collect().await {
+    type Data = Bytes;
+    type Error = BodyLimitError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.project().inner.poll_frame(cx) {
+            Poll::Ready(Some(Ok(f))) => Poll::Ready(Some(Ok(f))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(BodyLimitError::Other(e.to_string()))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Size limit + idle timeout between frames, then collect.
+pub async fn collect_limited<B>(
+    body: B,
+    max: usize,
+    idle: Duration,
+) -> Result<Bytes, BodyLimitError>
+where
+    B: Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    let mapped = MapErrBody::new(body);
+    let limited = LimitedBody::new(mapped, max);
+    let idle_wrapped = IdleBody::new(limited, idle);
+    match idle_wrapped.collect().await {
         Ok(c) => Ok(c.to_bytes()),
         Err(e) => Err(e),
     }
+}
+
+/// Wrap an upstream response body with idle timeout (streaming path).
+pub fn idle_wrap<B>(body: B, idle: Duration) -> IdleBody<MapErrBody<B>>
+where
+    B: Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    IdleBody::new(MapErrBody::new(body), idle)
 }

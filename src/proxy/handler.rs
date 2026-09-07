@@ -1,7 +1,7 @@
 use crate::config::{HeaderConfig, StickyConfig};
 use crate::lb::{LoadBalancer, UpstreamRuntime};
 use crate::metrics::Metrics;
-use crate::proxy::body_limit::{collect_limited, BodyLimitError};
+use crate::proxy::body_limit::{collect_limited, idle_wrap, BodyLimitError};
 use crate::proxy::client::{boxed_body, HttpClient};
 use crate::router::Router;
 use crate::security::Acl;
@@ -37,7 +37,11 @@ pub struct ProxyContext {
     pub security_headers: bool,
     /// Whether the client connection is TLS-terminated by us.
     pub client_is_tls: bool,
+    /// Limits concurrent in-flight requests (HTTP/1.1 and HTTP/2 streams).
+    pub request_limit: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    pub idle_timeout: Duration,
 }
+
 
 pub async fn proxy_request(
     req: Request<Incoming>,
@@ -50,6 +54,25 @@ pub async fn proxy_request(
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let is_upgrade = is_upgrade_request(&req);
+
+    // Concurrent request / HTTP/2 stream limit (not just TCP accepts)
+    let _request_permit = if let Some(ref sem) = ctx.request_limit {
+        match sem.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                ctx.metrics
+                    .requests_total
+                    .with_label_values(&[method.as_str(), "503", "none"])
+                    .inc();
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Too Many Concurrent Requests",
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     if let Some(ref acl) = ctx.acl {
         if !acl.is_allowed(remote_addr.ip()) {
@@ -97,7 +120,7 @@ pub async fn proxy_request(
     let (parts, body) = req.into_parts();
 
     // Bound memory: enforce limit while streaming frames into a buffer for retry support.
-    let body_bytes = match collect_limited(body, ctx.max_body_bytes).await {
+    let body_bytes = match collect_limited(body, ctx.max_body_bytes, ctx.idle_timeout).await {
         Ok(b) => b,
         Err(BodyLimitError::TooLarge) => {
             ctx.metrics
@@ -106,7 +129,14 @@ pub async fn proxy_request(
                 .inc();
             return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"));
         }
-        Err(BodyLimitError::Hyper(e)) => {
+        Err(BodyLimitError::IdleTimeout) => {
+            ctx.metrics
+                .requests_total
+                .with_label_values(&[method.as_str(), "408", "none"])
+                .inc();
+            return Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request Body Idle Timeout"));
+        }
+        Err(BodyLimitError::Other(e)) => {
             error!(error = %e, "failed to read request body");
             return Ok(error_response(StatusCode::BAD_REQUEST, "Bad Request"));
         }
@@ -246,7 +276,7 @@ async fn proxy_upgrade(
 
     let (parts, body) = req.into_parts();
     // For upgrades we stream the body without full buffer.
-    let body_bytes = match collect_limited(body, ctx.max_body_bytes).await {
+    let body_bytes = match collect_limited(body, ctx.max_body_bytes, ctx.idle_timeout).await {
         Ok(b) => b,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Bad Request"),
     };
@@ -263,6 +293,7 @@ async fn proxy_upgrade(
         remote_addr,
         &ctx.headers,
         ctx.request_timeout,
+        ctx.idle_timeout,
         ctx.client_is_tls,
         true, // preserve upgrade headers
     )
@@ -297,6 +328,7 @@ async fn attempt_proxy(
     remote_addr: SocketAddr,
     headers_cfg: &HeaderConfig,
     request_timeout: Duration,
+    idle_timeout: Duration,
     client_is_tls: bool,
     preserve_upgrade: bool,
 ) -> Result<Response<ResponseBody>, String> {
@@ -370,8 +402,8 @@ async fn attempt_proxy(
         resp_builder = resp_builder.header(name, value);
     }
 
-    let streamed = resp_body
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+    let streamed = idle_wrap(resp_body, idle_timeout)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         .boxed();
 
     resp_builder

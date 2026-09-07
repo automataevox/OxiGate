@@ -36,7 +36,7 @@ pub struct Config {
     #[serde(default = "default_retries")]
     pub retries: u32,
 
-    /// Global max concurrent in-flight requests (0 = unlimited).
+    /// Max concurrent in-flight requests/streams (HTTP/1.1 and HTTP/2). 0 = unlimited.
     #[serde(default)]
     pub max_connections: usize,
 

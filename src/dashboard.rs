@@ -1,4 +1,4 @@
-//! Built-in web dashboard + JSON stats API (optionally authenticated).
+//! Admin dashboard + metrics (token reloadable via shared state).
 
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
@@ -7,15 +7,16 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub struct DashboardState {
     pub metrics: Arc<Metrics>,
-    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub rate_limiter: Arc<RwLock<Option<Arc<RateLimiter>>>>,
     pub started: Instant,
     pub version: &'static str,
-    pub admin_token: Option<String>,
+    /// Reloadable admin token (None / empty = open; not recommended).
+    pub admin_token: Arc<RwLock<Option<String>>>,
 }
 
 pub async fn handle_admin(
@@ -24,7 +25,6 @@ pub async fn handle_admin(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = req.uri().path();
 
-    // healthz stays open for probes
     if path == "/healthz" {
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -33,8 +33,9 @@ pub async fn handle_admin(
             .unwrap());
     }
 
-    if let Some(ref token) = state.admin_token {
-        if !authorized(&req, token) {
+    let token = state.admin_token.read().unwrap().clone();
+    if let Some(ref token) = token {
+        if !token.is_empty() && !authorized(&req, token) {
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header("WWW-Authenticate", "Bearer")
@@ -70,7 +71,6 @@ fn authorized(req: &Request<Incoming>, token: &str) -> bool {
             }
         }
     }
-    // Also allow ?token= for browser dashboard convenience
     if let Some(q) = req.uri().query() {
         for part in q.split('&') {
             if let Some(v) = part.strip_prefix("token=") {
@@ -83,10 +83,13 @@ fn authorized(req: &Request<Incoming>, token: &str) -> bool {
 
 fn stats_json(state: &DashboardState) -> String {
     let uptime = state.started.elapsed().as_secs();
-    let (allows, rejects) = if let Some(rl) = &state.rate_limiter {
-        (rl.allows(), rl.rejects())
-    } else {
-        (0, 0)
+    let (allows, rejects) = {
+        let rl = state.rate_limiter.read().unwrap();
+        if let Some(ref rl) = *rl {
+            (rl.allows(), rl.rejects())
+        } else {
+            (0, 0)
+        }
     };
     let text = state.metrics.gather();
     let mut requests = 0u64;

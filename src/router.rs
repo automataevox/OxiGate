@@ -123,6 +123,8 @@ mod tests {
             force_retry_with_body: false,
             acl: None,
             security_headers: true,
+            admin_token: None,
+            proxy_protocol_trusted_cidrs: vec![],
         }
     }
 
