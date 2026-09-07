@@ -96,7 +96,6 @@ pub struct Config {
     pub proxy_protocol_trusted_cidrs: Vec<String>,
 }
 
-
 fn default_max_body() -> usize {
     16 * 1024 * 1024
 }
@@ -110,7 +109,6 @@ pub struct AclConfig {
     #[serde(default)]
     pub deny: Vec<String>,
 }
-
 
 fn default_pool_max_idle() -> usize {
     64
@@ -128,7 +126,6 @@ pub struct RateLimitConfigYaml {
 fn default_burst() -> f64 {
     1.5
 }
-
 
 fn default_metrics_listen() -> SocketAddr {
     "0.0.0.0:9090".parse().unwrap()

@@ -22,10 +22,7 @@ pub struct HealthRuntime {
     pub lbs: Box<dyn Fn() -> Vec<Arc<LoadBalancer>> + Send + Sync>,
 }
 
-pub async fn run_health_checks(
-    shared: Arc<RwLock<HealthRuntime>>,
-    metrics: Arc<Metrics>,
-) {
+pub async fn run_health_checks(shared: Arc<RwLock<HealthRuntime>>, metrics: Arc<Metrics>) {
     let mut state: HashMap<String, ThresholdState> = HashMap::new();
 
     loop {
@@ -60,8 +57,7 @@ pub async fn run_health_checks(
                 } else {
                     entry.fails += 1;
                     entry.successes = 0;
-                    if upstream.is_healthy()
-                        && entry.fails >= health_cfg.unhealthy_threshold.max(1)
+                    if upstream.is_healthy() && entry.fails >= health_cfg.unhealthy_threshold.max(1)
                     {
                         upstream.set_healthy(false);
                         warn!(upstream = %upstream.address, "upstream marked unhealthy");

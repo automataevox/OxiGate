@@ -21,7 +21,10 @@ impl Metrics {
         let registry = Registry::new();
 
         let requests_total = IntCounterVec::new(
-            Opts::new("oxigate_requests_total", "Total number of requests processed"),
+            Opts::new(
+                "oxigate_requests_total",
+                "Total number of requests processed",
+            ),
             &["method", "status", "upstream"],
         )?;
         registry.register(Box::new(requests_total.clone()))?;
@@ -56,20 +59,25 @@ impl Metrics {
         )?;
         registry.register(Box::new(upstream_health.clone()))?;
 
-        let rate_limit_rejects =
-            IntCounter::new("oxigate_rate_limit_rejects_total", "Requests rejected by rate limiter")?;
+        let rate_limit_rejects = IntCounter::new(
+            "oxigate_rate_limit_rejects_total",
+            "Requests rejected by rate limiter",
+        )?;
         registry.register(Box::new(rate_limit_rejects.clone()))?;
 
-        let rate_limit_allows =
-            IntCounter::new("oxigate_rate_limit_allows_total", "Requests allowed by rate limiter")?;
+        let rate_limit_allows = IntCounter::new(
+            "oxigate_rate_limit_allows_total",
+            "Requests allowed by rate limiter",
+        )?;
         registry.register(Box::new(rate_limit_allows.clone()))?;
 
-        let active_connections =
-            IntGauge::new("oxigate_active_connections", "Currently accepted client connections")?;
+        let active_connections = IntGauge::new(
+            "oxigate_active_connections",
+            "Currently accepted client connections",
+        )?;
         registry.register(Box::new(active_connections.clone()))?;
 
-        let retries_total =
-            IntCounter::new("oxigate_retries_total", "Upstream retry attempts")?;
+        let retries_total = IntCounter::new("oxigate_retries_total", "Upstream retry attempts")?;
         registry.register(Box::new(retries_total.clone()))?;
 
         Ok(Self {

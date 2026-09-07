@@ -11,8 +11,8 @@ use std::sync::Arc;
 /// Load a rustls ServerConfig from PEM cert + key paths.
 /// Enables ALPN for HTTP/1.1 and HTTP/2.
 pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
-    let cert_file = File::open(cert_path)
-        .with_context(|| format!("failed to open TLS cert: {cert_path}"))?;
+    let cert_file =
+        File::open(cert_path).with_context(|| format!("failed to open TLS cert: {cert_path}"))?;
     let mut cert_reader = BufReader::new(cert_file);
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .collect::<std::result::Result<_, _>>()

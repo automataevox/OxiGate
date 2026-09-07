@@ -1,5 +1,5 @@
 use oxigate::config::Config;
-use oxigate::dashboard::{handle_admin, DashboardState};
+use oxigate::dashboard::{handle_admin, handle_dashboard_ws, DashboardState};
 use oxigate::health::{run_health_checks, HealthRuntime};
 use oxigate::metrics::Metrics;
 use oxigate::proxy::client::{build_client, ClientOptions};
@@ -32,7 +32,10 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "oxigate", about = "Ultra-fast L7 reverse proxy & load balancer")]
+#[command(
+    name = "oxigate",
+    about = "Ultra-fast L7 reverse proxy & load balancer"
+)]
 struct Args {
     #[arg(short, long, default_value = "config.yaml")]
     config: String,
@@ -74,10 +77,7 @@ impl Runtime {
         };
         let proxy_trusted =
             if config.proxy_protocol && !config.proxy_protocol_trusted_cidrs.is_empty() {
-                Some(Acl::from_config(
-                    &config.proxy_protocol_trusted_cidrs,
-                    &[],
-                )?)
+                Some(Acl::from_config(&config.proxy_protocol_trusted_cidrs, &[])?)
             } else {
                 None
             };
@@ -129,9 +129,8 @@ async fn main() -> anyhow::Result<()> {
     let admin_token = Arc::new(RwLock::new(
         runtime.read().unwrap().config.admin_token.clone(),
     ));
-    let shared_rl: Arc<RwLock<Option<Arc<RateLimiter>>>> = Arc::new(RwLock::new(
-        runtime.read().unwrap().rate_limiter.clone(),
-    ));
+    let shared_rl: Arc<RwLock<Option<Arc<RateLimiter>>>> =
+        Arc::new(RwLock::new(runtime.read().unwrap().rate_limiter.clone()));
 
     // Health runtime (client + config + lbs fully refreshable)
     let health_rt = {
@@ -410,9 +409,18 @@ async fn run_admin_server(
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let state = state.clone();
-                        async move { handle_admin(req, state).await }
+                        async move {
+                            if req.uri().path() == "/ws"
+                                && req.headers().contains_key(hyper::header::UPGRADE)
+                            {
+                                Ok(handle_dashboard_ws(req, state))
+                            } else {
+                                handle_admin(req, state).await
+                            }
+                        }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(true)
                         .serve_connection(io, service)
                         .await;
                 });

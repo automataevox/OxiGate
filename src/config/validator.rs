@@ -72,7 +72,12 @@ pub fn validate(config: &Config) -> Result<()> {
             "proxy_protocol=true without proxy_protocol_trusted_cidrs — any client can spoof source IP"
         );
     }
-    if config.admin_token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+    if config
+        .admin_token
+        .as_ref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
         tracing::warn!(
             "admin_token is not set — /metrics and /dashboard are unauthenticated (set admin_token in production)"
         );
@@ -88,9 +93,10 @@ fn validate_upstream(i: usize, upstream: &super::Upstream) -> Result<()> {
     if upstream.weight == 0 {
         bail!("upstream[{i}] weight must be > 0");
     }
-    let url = upstream.address.parse::<http::Uri>().map_err(|e| {
-        anyhow::anyhow!("upstream[{i}] is not a valid URI: {e}")
-    })?;
+    let url = upstream
+        .address
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("upstream[{i}] is not a valid URI: {e}"))?;
     match url.scheme_str() {
         Some("http") | Some("https") => {}
         other => bail!("upstream[{i}] scheme must be http or https, got {other:?}"),

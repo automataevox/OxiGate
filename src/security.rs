@@ -17,8 +17,14 @@ struct IpNet {
 impl Acl {
     pub fn from_config(allow: &[String], deny: &[String]) -> anyhow::Result<Self> {
         Ok(Self {
-            allow: allow.iter().map(|s| parse_cidr(s)).collect::<Result<_, _>>()?,
-            deny: deny.iter().map(|s| parse_cidr(s)).collect::<Result<_, _>>()?,
+            allow: allow
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<_, _>>()?,
+            deny: deny
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<_, _>>()?,
         })
     }
 

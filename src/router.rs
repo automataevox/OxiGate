@@ -95,16 +95,14 @@ mod tests {
                 address: "http://127.0.0.1:8081".into(),
                 weight: 1,
             }],
-            routes: vec![
-                RouteConfig {
-                    path_prefix: "/api".into(),
-                    upstreams: vec![Upstream {
-                        address: "http://127.0.0.1:9001".into(),
-                        weight: 1,
-                    }],
-                    load_balancing: Some(LoadBalancingAlgorithm::LeastConnections),
-                },
-            ],
+            routes: vec![RouteConfig {
+                path_prefix: "/api".into(),
+                upstreams: vec![Upstream {
+                    address: "http://127.0.0.1:9001".into(),
+                    weight: 1,
+                }],
+                load_balancing: Some(LoadBalancingAlgorithm::LeastConnections),
+            }],
             load_balancing: LoadBalancingAlgorithm::RoundRobin,
             health_check: Default::default(),
             timeouts: Default::default(),

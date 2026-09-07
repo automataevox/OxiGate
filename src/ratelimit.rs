@@ -61,11 +61,12 @@ impl RateLimiter {
         // consumes the current slot, so tolerance covers the remaining
         // requests in the burst.
         let burst_requests = self.cfg.rate as f64 * self.cfg.burst;
-        let max_credit = self
-            .emission
-            .mul_f64((burst_requests - 1.0).max(0.0));
+        let max_credit = self.emission.mul_f64((burst_requests - 1.0).max(0.0));
 
-        let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket { tat: now });
+        let mut entry = self
+            .buckets
+            .entry(ip)
+            .or_insert_with(|| Bucket { tat: now });
 
         // GCRA: allow if now + max_credit >= TAT
         let tat = entry.tat;

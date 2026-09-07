@@ -42,7 +42,6 @@ pub struct ProxyContext {
     pub idle_timeout: Duration,
 }
 
-
 pub async fn proxy_request(
     req: Request<Incoming>,
     _state: crate::state::AppState,
@@ -91,7 +90,10 @@ pub async fn proxy_request(
                 .requests_total
                 .with_label_values(&[method.as_str(), "429", "none"])
                 .inc();
-            return Ok(error_response(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"));
+            return Ok(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too Many Requests",
+            ));
         }
         ctx.metrics.rate_limit_allows.inc();
     }
@@ -127,14 +129,20 @@ pub async fn proxy_request(
                 .requests_total
                 .with_label_values(&[method.as_str(), "413", "none"])
                 .inc();
-            return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"));
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large",
+            ));
         }
         Err(BodyLimitError::IdleTimeout) => {
             ctx.metrics
                 .requests_total
                 .with_label_values(&[method.as_str(), "408", "none"])
                 .inc();
-            return Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request Body Idle Timeout"));
+            return Ok(error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Request Body Idle Timeout",
+            ));
         }
         Err(BodyLimitError::Other(e)) => {
             error!(error = %e, "failed to read request body");
@@ -145,7 +153,10 @@ pub async fn proxy_request(
     let may_retry = ctx.force_retry_with_body
         || body_bytes.is_empty()
         || !ctx.retry_idempotent_only
-        || matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE");
+        || matches!(
+            method.as_str(),
+            "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE"
+        );
     let max_attempts = if may_retry {
         ctx.retries.saturating_add(1)
     } else {

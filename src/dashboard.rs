@@ -1,8 +1,10 @@
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::Incoming;
+use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
 use hyper::{Request, Response, StatusCode};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -63,6 +65,76 @@ pub async fn handle_admin(
             .body(Full::new(Bytes::from(r#"{"error":"not_found"}"#)))
             .unwrap()),
     }
+}
+
+pub fn handle_dashboard_ws(
+    req: Request<Incoming>,
+    state: Arc<DashboardState>,
+) -> Response<Full<Bytes>> {
+    let token = state.admin_token.read().unwrap().clone();
+    if let Some(ref token) = token {
+        if !token.is_empty() && !authorized(&req, token) {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("WWW-Authenticate", "Bearer")
+                .body(Full::new(Bytes::from("unauthorized")))
+                .unwrap();
+        }
+    }
+
+    let key = match req.headers().get(SEC_WEBSOCKET_KEY) {
+        Some(key) => key.as_bytes(),
+        None => return error_response(StatusCode::BAD_REQUEST, "missing websocket key"),
+    };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key);
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let io = hyper_util::rt::TokioIo::new(upgraded);
+        let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+              _ = ticker.tick() => {
+                if socket.send(tokio_tungstenite::tungstenite::Message::Text(stats_json(&state).into())).await.is_err() {
+                  break;
+                }
+              }
+              message = socket.next() => {
+                match message {
+                  Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+                  Some(Err(_)) => break,
+                  _ => {}
+                }
+              }
+            }
+        }
+        let _ = socket.close(None).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(CONNECTION, "Upgrade")
+        .header(UPGRADE, "websocket")
+        .header(SEC_WEBSOCKET_ACCEPT, accept)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+fn error_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(message)))
+        .unwrap()
 }
 
 fn authorized(req: &Request<Incoming>, token: &str) -> bool {
@@ -774,7 +846,26 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       b.classList.add("show");
     }
 
-    async function refresh() {
+    function applyStats(s) {
+      showBanner("");
+      setLive(true, "Live");
+      document.querySelectorAll(".skel").forEach((el) => el.classList.remove("skel"));
+      $("kpiRequests").textContent = fmtNum(s.requests_total);
+      $("kpiActive").textContent = fmtNum(s.active_connections);
+      $("kpiUptime").textContent = fmtUptime(s.uptime_secs);
+      $("kpiRetries").textContent = fmtNum(s.retries_total);
+      $("kpiRejects").textContent = fmtNum(s.rate_limit_rejects);
+      $("kpiRlHint").textContent = "allowed: " + fmtNum(s.rate_limit_allows);
+      $("kpiRlCard").classList.toggle("warn", (Number(s.rate_limit_rejects) || 0) > 0);
+      $("kpiRetriesCard").classList.toggle("warn", (Number(s.retries_total) || 0) > 0);
+      $("versionPill").textContent = "v" + (s.version || "?");
+      renderUpstreams(s.upstreams || []);
+      renderBars($("statusBars"), s.by_status || {});
+      renderBars($("methodBars"), s.by_method || {});
+      $("lastUpdated").textContent = "Last update: " + new Date().toLocaleTimeString();
+    }
+
+    async function refreshFallback() {
       try {
         const res = await fetch(withAuth("/api/stats"), {
           headers: { Accept: "application/json" },
@@ -782,51 +873,37 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         });
         if (res.status === 401) {
           setLive(false, "Unauthorized");
-          showBanner(
-            "Admin token required. Open with <code>?token=YOUR_TOKEN</code> or send " +
-            "<code>Authorization: Bearer …</code>. Health endpoint <code>/healthz</code> stays public."
-          );
+          showBanner("Admin token required. Open with <code>?token=YOUR_TOKEN</code>.");
           return;
         }
         if (!res.ok) throw new Error("HTTP " + res.status);
-        const s = await res.json();
-        showBanner("");
-        setLive(true, "Live");
-
-        // Remove skeletons
-        document.querySelectorAll(".skel").forEach((el) => el.classList.remove("skel"));
-
-        $("kpiRequests").textContent = fmtNum(s.requests_total);
-        $("kpiActive").textContent = fmtNum(s.active_connections);
-        $("kpiUptime").textContent = fmtUptime(s.uptime_secs);
-        $("kpiRetries").textContent = fmtNum(s.retries_total);
-        $("kpiRejects").textContent = fmtNum(s.rate_limit_rejects);
-        $("kpiRlHint").textContent = "allowed: " + fmtNum(s.rate_limit_allows);
-
-        const rej = Number(s.rate_limit_rejects) || 0;
-        $("kpiRlCard").classList.toggle("warn", rej > 0);
-        $("kpiRetriesCard").classList.toggle("warn", (Number(s.retries_total) || 0) > 0);
-
-        $("versionPill").textContent = "v" + (s.version || "?");
-        renderUpstreams(s.upstreams || []);
-        renderBars($("statusBars"), s.by_status || {});
-        renderBars($("methodBars"), s.by_method || {});
-
-        $("lastUpdated").textContent =
-          "Last update: " + new Date().toLocaleTimeString();
+        applyStats(await res.json());
       } catch (err) {
         setLive(false, "Offline");
-        showBanner("Cannot reach stats API: " + escapeHtml(err.message || String(err)));
+        showBanner("Cannot reach dashboard: " + escapeHtml(err.message || String(err)));
       }
     }
 
-    refresh();
-    setInterval(refresh, 2000);
+    function connectWebSocket() {
+      const url = new URL("/ws", window.location.href);
+      url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const token = new URLSearchParams(window.location.search).get("token");
+      if (token) url.searchParams.set("token", token);
+      const socket = new WebSocket(url);
+      socket.onopen = () => setLive(true, "Live");
+      socket.onmessage = (event) => {
+        try { applyStats(JSON.parse(event.data)); }
+        catch (_) { setLive(false, "Bad data"); }
+      };
+      socket.onerror = () => socket.close();
+      socket.onclose = () => {
+        setLive(false, "Reconnecting");
+        setTimeout(connectWebSocket, 2000);
+      };
+    }
 
-    // Visibility: pause refresh when tab hidden (saves work)
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) refresh();
-    });
+    refreshFallback();
+    connectWebSocket();
   })();
   </script>
 </body>
