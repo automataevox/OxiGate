@@ -1,7 +1,7 @@
 [package]
 name = "oxigate"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["OxiGate Contributors"]
 description = "Ultra-fast, memory-safe L7 HTTP/HTTPS reverse proxy and load balancer written in pure Rust"
 license = "MIT OR Apache-2.0"
