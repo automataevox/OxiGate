@@ -115,3 +115,22 @@ Sleduj RSS, panics, healthz, p99.
 | Soak 24h | `./benchmark/soak.sh 24` |
 | HAProxy bench | `./benchmark/run_benchmarks.sh` |
 | CI / Docker | push na GitHub `main` |
+
+## Security & correctness fixes (post-review)
+
+- **Body limit**: enforced while reading frames (`LimitedBody`), not after full buffer
+- **Admin auth**: set `admin_token` — protects `/metrics`, `/dashboard`, `/api/stats` ( `/healthz` open )
+- **SIGHUP**: rebuilds router, HTTP client, TLS, rate limiter, connection limits
+- **Health thresholds**: `unhealthy_threshold` / `healthy_threshold` + `timeout_secs` honored
+- **WebSocket**: `Connection` / `Upgrade` preserved on upgrade requests
+- **HTTPS upstreams**: `hyper-rustls` connector
+- **X-Forwarded-Proto**: `https` when TLS terminated locally; XFF set from real/PROXY IP
+- **PROXY trust**: `proxy_protocol_trusted_cidrs`
+- **Path match**: `/api` does not match `/apiary`
+- **Graceful shutdown**: `JoinSet` drain up to 15s
+- **Docker Compose**: upstreams use service DNS (`backend1`, …)
+
+```bash
+curl -H "Authorization: Bearer changeme" http://127.0.0.1:9090/metrics
+curl "http://127.0.0.1:9090/dashboard?token=changeme"
+```

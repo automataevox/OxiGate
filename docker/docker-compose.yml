@@ -6,8 +6,10 @@ services:
     ports:
       - "8080:8080"
       - "9090:9090"
+    environment:
+      - RUST_LOG=info
     volumes:
-      - ../config.yaml:/etc/oxigate/config.yaml:ro
+      - ./oxigate-docker.yaml:/etc/oxigate/config.yaml:ro
     depends_on:
       - backend1
       - backend2
@@ -15,7 +17,6 @@ services:
 
   backend1:
     image: nginx:alpine
-    # simple static
   backend2:
     image: nginx:alpine
   backend3:

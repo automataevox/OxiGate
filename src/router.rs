@@ -77,7 +77,8 @@ fn path_matches(path: &str, prefix: &str) -> bool {
     if prefix == "/" {
         return true;
     }
-    path == prefix || path.starts_with(&format!("{prefix}/")) || path.starts_with(prefix)
+    // Exact match or boundary at '/' so /api does not match /apiary
+    path == prefix || path.starts_with(&(prefix.trim_end_matches('/').to_string() + "/"))
 }
 
 #[cfg(test)]

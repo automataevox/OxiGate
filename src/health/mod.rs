@@ -1,46 +1,86 @@
+use crate::config::HealthCheckConfig;
 use crate::lb::{LoadBalancer, UpstreamRuntime};
 use crate::metrics::Metrics;
 use crate::proxy::client::{boxed_body, HttpClient};
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+/// Tracks consecutive successes/failures per upstream address.
+struct ThresholdState {
+    fails: u32,
+    successes: u32,
+}
+
 pub async fn run_health_checks(
-    lbs: Vec<Arc<LoadBalancer>>,
+    lbs_provider: Arc<dyn Fn() -> Vec<Arc<LoadBalancer>> + Send + Sync>,
     client: HttpClient,
     metrics: Arc<Metrics>,
-    interval: Duration,
-    path: String,
+    health_cfg: HealthCheckConfig,
 ) {
+    let interval = Duration::from_secs(health_cfg.interval_secs.max(1));
+    let timeout = Duration::from_secs(health_cfg.timeout_secs.max(1));
+    let path = health_cfg.path.clone();
+    let mut state: HashMap<String, ThresholdState> = HashMap::new();
+
     loop {
+        let lbs = lbs_provider();
         for lb in &lbs {
             for upstream in lb.upstreams() {
-                let healthy = check_one(&client, upstream, &path).await;
-                let was_healthy = upstream.is_healthy();
-                upstream.set_healthy(healthy);
+                let healthy_now = check_one(&client, upstream, &path, timeout).await;
+                let entry = state
+                    .entry(upstream.address.clone())
+                    .or_insert(ThresholdState {
+                        fails: 0,
+                        successes: 0,
+                    });
+
+                if healthy_now {
+                    entry.successes += 1;
+                    entry.fails = 0;
+                    if !upstream.is_healthy()
+                        && entry.successes >= health_cfg.healthy_threshold.max(1)
+                    {
+                        upstream.set_healthy(true);
+                        warn!(upstream = %upstream.address, "upstream recovered");
+                    }
+                } else {
+                    entry.fails += 1;
+                    entry.successes = 0;
+                    if upstream.is_healthy()
+                        && entry.fails >= health_cfg.unhealthy_threshold.max(1)
+                    {
+                        upstream.set_healthy(false);
+                        warn!(upstream = %upstream.address, "upstream marked unhealthy");
+                    }
+                }
 
                 metrics
                     .upstream_health
                     .with_label_values(&[&upstream.address])
-                    .set(if healthy { 1 } else { 0 });
+                    .set(if upstream.is_healthy() { 1 } else { 0 });
 
-                if was_healthy && !healthy {
-                    warn!(upstream = %upstream.address, "upstream marked unhealthy");
-                } else if !was_healthy && healthy {
-                    warn!(upstream = %upstream.address, "upstream recovered");
-                } else {
-                    debug!(upstream = %upstream.address, healthy, "health check");
-                }
+                debug!(
+                    upstream = %upstream.address,
+                    healthy = upstream.is_healthy(),
+                    "health check"
+                );
             }
         }
         sleep(interval).await;
     }
 }
 
-async fn check_one(client: &HttpClient, upstream: &UpstreamRuntime, path: &str) -> bool {
+async fn check_one(
+    client: &HttpClient,
+    upstream: &UpstreamRuntime,
+    path: &str,
+    timeout: Duration,
+) -> bool {
     let url = format!(
         "{}{}",
         upstream.address.trim_end_matches('/'),
@@ -63,7 +103,7 @@ async fn check_one(client: &HttpClient, upstream: &UpstreamRuntime, path: &str) 
         Err(_) => return false,
     };
 
-    match tokio::time::timeout(Duration::from_secs(2), client.request(req)).await {
+    match tokio::time::timeout(timeout, client.request(req)).await {
         Ok(Ok(resp)) => {
             let status = resp.status();
             status.is_success() || status.is_redirection() || status == StatusCode::NOT_FOUND

@@ -1,15 +1,16 @@
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
-/// Streaming-capable body type used by the upstream client.
 pub type ClientBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
-pub type HttpClient = Client<HttpConnector, ClientBody>;
+type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
+pub type HttpClient = Client<HttpsConnector, ClientBody>;
 
 #[derive(Clone)]
 pub struct ClientOptions {
@@ -18,15 +19,21 @@ pub struct ClientOptions {
     pub http2: bool,
 }
 
-/// Build a production-tuned HTTP client with connection pooling.
-/// `http2` enables HTTP/2 prior knowledge / ALPN where the connector supports it.
+/// HTTP/HTTPS client (rustls) with pooling and optional HTTP/2.
 pub fn build_client(opts: ClientOptions) -> HttpClient {
-    let mut connector = HttpConnector::new();
-    connector.set_nodelay(true);
-    connector.set_connect_timeout(Some(opts.connect_timeout));
-    connector.set_keepalive(Some(Duration::from_secs(30)));
-    connector.enforce_http(false);
-    connector.set_reuse_address(true);
+    let mut http = HttpConnector::new();
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(opts.connect_timeout));
+    http.set_keepalive(Some(Duration::from_secs(30)));
+    http.enforce_http(false);
+    http.set_reuse_address(true);
+
+    let https = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http);
 
     let mut builder = Client::builder(TokioExecutor::new());
     builder = builder
@@ -36,17 +43,15 @@ pub fn build_client(opts: ClientOptions) -> HttpClient {
         .set_host(true);
 
     if opts.http2 {
-        // Prefer HTTP/2 when upstream supports it (h2c prior knowledge for cleartext).
         builder = builder.http2_only(false);
         builder = builder.http2_adaptive_window(true);
         builder = builder.http2_keep_alive_interval(Duration::from_secs(30));
         builder = builder.http2_keep_alive_timeout(Duration::from_secs(10));
     }
 
-    builder.build(connector)
+    builder.build(https)
 }
 
-/// Helper to box any body into ClientBody.
 pub fn boxed_body<B>(body: B) -> ClientBody
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,

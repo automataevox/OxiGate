@@ -86,7 +86,16 @@ pub struct Config {
     /// Security response headers baseline.
     #[serde(default = "default_true")]
     pub security_headers: bool,
+
+    /// Bearer token required for /dashboard, /api/stats, /metrics (empty = open, not recommended).
+    #[serde(default)]
+    pub admin_token: Option<String>,
+
+    /// When proxy_protocol is true, only these source CIDRs may send PROXY headers.
+    #[serde(default)]
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
 }
+
 
 fn default_max_body() -> usize {
     16 * 1024 * 1024

@@ -62,3 +62,12 @@ security_headers: true
 #   allow:
 #     - "10.0.0.0/8"
 #   deny: []
+
+
+# Protect dashboard/metrics (recommended in production)
+admin_token: "changeme"
+
+# When proxy_protocol: true, only accept PROXY headers from these CIDRs
+# proxy_protocol_trusted_cidrs:
+#   - "10.0.0.0/8"
+#   - "192.168.0.0/16"

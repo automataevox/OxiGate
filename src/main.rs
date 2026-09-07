@@ -5,12 +5,12 @@ use oxigate::metrics::Metrics;
 use oxigate::proxy::client::{build_client, ClientOptions};
 use oxigate::proxy::handler::ProxyContext;
 use oxigate::proxy::proxy_request;
+use oxigate::proxy_protocol;
 use oxigate::ratelimit::{RateLimitConfig, RateLimiter};
 use oxigate::router::Router;
+use oxigate::security::Acl;
 use oxigate::state::AppState;
 use oxigate::tls;
-use oxigate::proxy_protocol;
-use oxigate::security;
 
 use bytes::Bytes;
 use clap::Parser;
@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
@@ -37,9 +38,65 @@ struct Args {
     config: String,
 }
 
+/// Runtime pieces that SIGHUP fully rebuilds.
+struct Runtime {
+    config: Config,
+    router: Arc<Router>,
+    client: oxigate::proxy::client::HttpClient,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    tls: Option<TlsAcceptor>,
+    conn_limit: Option<Arc<Semaphore>>,
+    proxy_trusted: Option<Acl>,
+}
+
+impl Runtime {
+    fn from_config(config: Config) -> anyhow::Result<Self> {
+        let client = build_client(ClientOptions {
+            connect_timeout: config.connect_timeout(),
+            pool_max_idle_per_host: config.pool_max_idle_per_host,
+            http2: config.upstream_http2,
+        });
+        let rate_limiter = config.rate_limit.as_ref().map(|rl| {
+            RateLimiter::new(RateLimitConfig {
+                rate: rl.rps,
+                window: Duration::from_secs(1),
+                burst: rl.burst,
+            })
+        });
+        let tls = if let Some(ref t) = config.tls {
+            Some(TlsAcceptor::from(tls::load_server_config(&t.cert, &t.key)?))
+        } else {
+            None
+        };
+        let conn_limit = if config.max_connections > 0 {
+            Some(Arc::new(Semaphore::new(config.max_connections)))
+        } else {
+            None
+        };
+        let proxy_trusted = if config.proxy_protocol && !config.proxy_protocol_trusted_cidrs.is_empty()
+        {
+            Some(Acl::from_config(
+                &config.proxy_protocol_trusted_cidrs,
+                &[],
+            )?)
+        } else {
+            None
+        };
+        let router = Arc::new(Router::from_config(&config));
+        Ok(Self {
+            config,
+            router,
+            client,
+            rate_limiter,
+            tls,
+            conn_limit,
+            proxy_trusted,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Structured JSON logging – compatible with OpenTelemetry log pipelines
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -54,89 +111,44 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = Config::from_file(&args.config)?;
+    let initial = Config::from_file(&args.config)?;
     info!(
-        listen = %config.listen,
-        metrics = %config.metrics_listen,
-        routes = config.routes.len(),
-        retries = config.retries,
-        max_connections = config.max_connections,
-        rate_limit = config.rate_limit.is_some(),
-        proxy_protocol = config.proxy_protocol,
-        upstream_http2 = config.upstream_http2,
-        tls = config.tls.is_some(),
-        "loaded configuration"
+        listen = %initial.listen,
+        admin = %initial.metrics_listen,
+        admin_auth = initial.admin_token.is_some(),
+        "starting OxiGate"
     );
 
-    let state = AppState::new(config.clone());
     let metrics = Arc::new(Metrics::new()?);
-    let router = Arc::new(std::sync::RwLock::new(Arc::new(Router::from_config(&config))));
-
-    let client = build_client(ClientOptions {
-        connect_timeout: config.connect_timeout(),
-        pool_max_idle_per_host: config.pool_max_idle_per_host,
-        http2: config.upstream_http2,
-    });
-
-    let rate_limiter = config.rate_limit.as_ref().map(|rl| {
-        RateLimiter::new(RateLimitConfig {
-            rate: rl.rps,
-            window: Duration::from_secs(1),
-            burst: rl.burst,
-        })
-    });
-
-    // Periodic rate-limit bucket cleanup
-    if let Some(ref rl) = rate_limiter {
-        let rl = rl.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                rl.cleanup(Duration::from_secs(120));
-            }
-        });
-    }
-
-    let conn_limit = if config.max_connections > 0 {
-        Some(Arc::new(Semaphore::new(config.max_connections)))
-    } else {
-        None
-    };
-
-    let tls_holder: Arc<std::sync::RwLock<Option<TlsAcceptor>>> = Arc::new(std::sync::RwLock::new(
-        if let Some(ref tls_cfg) = config.tls {
-            let server_config = tls::load_server_config(&tls_cfg.cert, &tls_cfg.key)?;
-            info!("TLS termination enabled (ALPN: h2, http/1.1)");
-            Some(TlsAcceptor::from(server_config))
-        } else {
-            None
-        }
-    ));
+    let state = AppState::new(initial.clone());
+    let runtime = Arc::new(std::sync::RwLock::new(Runtime::from_config(initial)?));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Health checks
+    // Health checks – always read current router from runtime
     {
-        let router = router.clone();
-        let client = client.clone();
+        let runtime = runtime.clone();
+        let client = runtime.read().unwrap().client.clone();
         let metrics = metrics.clone();
-        let interval = config.health_interval();
-        let path = config.health_check.path.clone();
+        let health_cfg = runtime.read().unwrap().config.health_check.clone();
+        let lbs_provider = Arc::new(move || runtime.read().unwrap().router.all_lbs());
         tokio::spawn(async move {
-            let lbs = router.read().unwrap().all_lbs();
-            run_health_checks(lbs, client, metrics, interval, path).await;
+            run_health_checks(lbs_provider, client, metrics, health_cfg).await;
         });
     }
 
-    // Admin / dashboard / metrics server
+    // Admin server
     {
+        let rt = runtime.read().unwrap();
         let dash = Arc::new(DashboardState {
             metrics: metrics.clone(),
-            rate_limiter: rate_limiter.clone(),
+            rate_limiter: rt.rate_limiter.clone(),
             started: Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
+            admin_token: rt.config.admin_token.clone(),
         });
-        let addr = config.metrics_listen;
+        let addr = rt.config.metrics_listen;
+        drop(rt);
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = run_admin_server(addr, dash, &mut shutdown_rx).await {
@@ -145,101 +157,109 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // SIGHUP reload
+    // SIGHUP – full runtime rebuild (client, limiter, tls, router, limits)
     {
         let state = state.clone();
-        let router = router.clone();
-        let tls_holder = tls_holder.clone();
+        let runtime = runtime.clone();
         let config_path = args.config.clone();
         tokio::spawn(async move {
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to register SIGHUP: {e}");
-                    return;
-                }
-            };
+            let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP");
             loop {
                 sighup.recv().await;
-                info!("received SIGHUP – reloading configuration");
+                info!("SIGHUP: rebuilding runtime");
                 match Config::from_file(&config_path) {
-                    Ok(new_cfg) => {
-                        if let Some(ref tls_cfg) = new_cfg.tls {
-                            match tls::load_server_config(&tls_cfg.cert, &tls_cfg.key) {
-                                Ok(sc) => {
-                                    *tls_holder.write().unwrap() = Some(TlsAcceptor::from(sc));
-                                    info!("TLS certificates reloaded");
-                                }
-                                Err(e) => error!("TLS reload failed: {e}"),
-                            }
+                    Ok(cfg) => match Runtime::from_config(cfg.clone()) {
+                        Ok(new_rt) => {
+                            state.swap_config(cfg);
+                            *runtime.write().unwrap() = new_rt;
+                            info!("runtime reloaded (router, client, TLS, rate-limit, limits)");
                         }
-                        state.swap_config(new_cfg.clone());
-                        *router.write().unwrap() = Arc::new(Router::from_config(&new_cfg));
-                        info!("configuration reloaded successfully");
-                    }
-                    Err(e) => error!("failed to reload configuration: {e}"),
+                        Err(e) => error!("runtime rebuild failed: {e}"),
+                    },
+                    Err(e) => error!("config reload failed: {e}"),
                 }
             }
         });
     }
 
-    // Graceful shutdown
+    // Shutdown signal
     {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM");
             let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT");
             tokio::select! {
-                _ = sigterm.recv() => info!("received SIGTERM"),
-                _ = sigint.recv() => info!("received SIGINT"),
+                _ = sigterm.recv() => info!("SIGTERM"),
+                _ = sigint.recv() => info!("SIGINT"),
             }
             let _ = shutdown_tx.send(true);
         });
     }
 
-    let listener = TcpListener::bind(config.listen).await?;
-    info!(
-        addr = %config.listen,
-        admin = %config.metrics_listen,
-        "OxiGate listening · dashboard http://{}/dashboard",
-        config.metrics_listen
-    );
+    let listen_addr = runtime.read().unwrap().config.listen;
+    let listener = TcpListener::bind(listen_addr).await?;
+    info!(%listen_addr, "listening");
 
-    let proxy_protocol = config.proxy_protocol;
     let mut shutdown_rx = shutdown_rx.clone();
+    let mut joins = JoinSet::new();
+    let metrics_accept = metrics.clone();
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("shutting down – draining connections");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    info!("draining {} connection task(s)", joins.len());
+                    // Stop accepting; wait for tasks with timeout
+                    let deadline = tokio::time::sleep(Duration::from_secs(15));
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            _ = &mut deadline => {
+                                warn!("drain timeout – aborting remaining tasks");
+                                joins.abort_all();
+                                break;
+                            }
+                            r = joins.join_next() => {
+                                if r.is_none() { break; }
+                            }
+                        }
+                    }
                     info!("shutdown complete");
                     break;
                 }
             }
             accept = listener.accept() => {
-                let (mut stream, remote_addr) = match accept {
+                let (stream, remote_addr) = match accept {
                     Ok(v) => v,
-                    Err(e) => {
-                        warn!("accept error: {e}");
-                        continue;
-                    }
+                    Err(e) => { warn!("accept: {e}"); continue; }
                 };
                 let _ = stream.set_nodelay(true);
 
-                let permit = if let Some(ref sem) = conn_limit {
-                    match sem.clone().try_acquire_owned() {
+                let rt_snap = {
+                    let rt = runtime.read().unwrap();
+                    (
+                        rt.router.clone(),
+                        rt.client.clone(),
+                        rt.rate_limiter.clone(),
+                        rt.tls.clone(),
+                        rt.conn_limit.clone(),
+                        rt.proxy_trusted.clone(),
+                        rt.config.clone(),
+                    )
+                };
+                let (router, client, rate_limiter, tls_acc, conn_limit, proxy_trusted, cfg) = rt_snap;
+
+                // Connection admission control (TCP-level; HTTP/2 multiplex still shares one conn)
+                let permit = if let Some(sem) = conn_limit {
+                    match sem.try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => {
-                            metrics.active_connections.set(0); // best-effort
                             let io = TokioIo::new(stream);
-                            tokio::spawn(async move {
+                            joins.spawn(async move {
                                 let service = service_fn(|_req: Request<Incoming>| async {
                                     Ok::<_, std::convert::Infallible>(
                                         Response::builder()
                                             .status(StatusCode::SERVICE_UNAVAILABLE)
-                                            .header("Connection", "close")
                                             .body(Full::new(Bytes::from("Service Unavailable")))
                                             .unwrap(),
                                     )
@@ -256,41 +276,40 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let state = state.clone();
-                let router = router.clone();
-                let client = client.clone();
-                let metrics = metrics.clone();
-                let tls_holder = tls_holder.clone();
-                let rate_limiter = rate_limiter.clone();
-
+                let metrics = metrics_accept.clone();
                 metrics.active_connections.inc();
 
-                tokio::spawn(async move {
+                joins.spawn(async move {
                     let _permit = permit;
 
-                    // PROXY protocol with buffered peek (safe if header absent)
-                    let (client_addr, stream) = if proxy_protocol {
-                        match oxigate::proxy_protocol::maybe_read_proxy_header(stream).await {
-                            Ok((Some(h), s)) => {
-                                tracing::debug!(src = %h.src, "PROXY protocol");
-                                (h.src, s)
-                            }
+                    // PROXY protocol only from trusted peers when configured
+                    let (client_addr, stream) = if cfg.proxy_protocol {
+                        let allowed = match &proxy_trusted {
+                            Some(acl) => acl.is_allowed(remote_addr.ip()),
+                            None => true, // misconfiguration risk — prefer setting trusted CIDRs
+                        };
+                        if !allowed {
+                            warn!(%remote_addr, "PROXY protocol from untrusted source rejected");
+                            metrics.active_connections.dec();
+                            return;
+                        }
+                        match proxy_protocol::maybe_read_proxy_header(stream).await {
+                            Ok((Some(h), s)) => (h.src, s),
                             Ok((None, s)) => (remote_addr, s),
                             Err(e) => {
-                                warn!(%remote_addr, error = %e, "PROXY protocol parse failed");
+                                warn!(%remote_addr, error=%e, "PROXY parse failed");
                                 metrics.active_connections.dec();
                                 return;
                             }
                         }
                     } else {
-                        (remote_addr, oxigate::proxy_protocol::PrefixedStream::new(stream, Vec::new()))
+                        (remote_addr, proxy_protocol::PrefixedStream::new(stream, Vec::new()))
                     };
 
-                    let cfg = state.load_config();
-                    let acl = cfg.acl.as_ref().and_then(|a| {
-                        oxigate::security::Acl::from_config(&a.allow, &a.deny).ok()
-                    });
+                    let acl = cfg.acl.as_ref().and_then(|a| Acl::from_config(&a.allow, &a.deny).ok());
+                    let client_is_tls = tls_acc.is_some();
                     let ctx = Arc::new(ProxyContext {
-                        router: router.read().unwrap().clone(),
+                        router,
                         client: client.clone(),
                         metrics: metrics.clone(),
                         retries: cfg.retries,
@@ -304,23 +323,25 @@ async fn main() -> anyhow::Result<()> {
                         force_retry_with_body: cfg.force_retry_with_body,
                         acl,
                         security_headers: cfg.security_headers,
+                        client_is_tls,
                     });
 
-                    // TLS acceptor may be reloaded via ArcSwap-like holder
-                    let acceptor = tls_holder.read().unwrap().clone();
-                    if let Some(acceptor) = acceptor {
+                    if let Some(acceptor) = tls_acc {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let io = TokioIo::new(tls_stream);
+                                // Mark TLS for X-Forwarded-Proto
+                                let mut ctx = (*ctx).clone();
+                                ctx.client_is_tls = true;
+                                let ctx = Arc::new(ctx);
                                 serve_connection(io, state, ctx, client_addr).await;
                             }
-                            Err(e) => tracing::debug!(%client_addr, "TLS handshake failed: {e}"),
+                            Err(e) => tracing::debug!(%client_addr, "TLS failed: {e}"),
                         }
                     } else {
                         let io = TokioIo::new(stream);
                         serve_connection(io, state, ctx, client_addr).await;
                     }
-
                     metrics.active_connections.dec();
                 });
             }
@@ -342,7 +363,6 @@ async fn serve_connection<I>(
         let state = state.clone();
         let ctx = ctx.clone();
         async move {
-            // OpenTelemetry-friendly span fields via tracing
             let span = tracing::info_span!(
                 "proxy_request",
                 otel.kind = "server",
@@ -350,14 +370,13 @@ async fn serve_connection<I>(
                 http.target = %req.uri(),
                 client.address = %remote_addr,
             );
-            let _guard = span.enter();
+            let _g = span.enter();
             proxy_request(req, state, ctx, remote_addr).await
         }
     });
-
     let builder = AutoBuilder::new(TokioExecutor::new());
     if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
-        tracing::debug!(%remote_addr, "connection closed: {e}");
+        tracing::debug!(%remote_addr, "conn closed: {e}");
     }
 }
 
@@ -367,8 +386,7 @@ async fn run_admin_server(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "admin/dashboard/metrics listening");
-
+    info!(%addr, "admin/metrics listening");
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
