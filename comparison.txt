@@ -1,0 +1,42 @@
+=== 1-minute benchmark comparison (Profile LowTraffic - 4K RPS) ===
+
+metric              OxiGate             HAProxy
+requests            1799148             1798005
+rps                 3999.91             3999.98
+p50                 0.094 ms            0.142 ms
+p95                 0.137 ms            0.239 ms
+p99                 0.187 ms            0.347 ms
+p999                0.897 ms            1.710 ms
+errors              0.000%              0.000%
+HTTP errors         0.000%              0.000%
+RSS after load      17.2 MB             31.7 MB
+
+
+=== 1-minute benchmark comparison (Profile Steady - 40K RPS) ===
+
+metric              OxiGate             HAProxy
+requests            1799148             1798005
+rps                 39980.88            39955.08
+p50                 0.066 ms            0.239 ms
+p95                 0.282 ms            1.716 ms
+p99                 2.057 ms            4.248 ms
+p999                4.264 ms            8.667 ms
+errors              0.000%              0.000%
+HTTP errors         0.000%              0.000%
+RSS after load      35.7 MB             34.3 MB
+
+
+=== 1-minute benchmark comparison (Profile Stress - Up to 2000VUs) ===
+
+metric              OxiGate             HAProxy
+requests            N/A                 N/A
+rps                 79829.89            54628.49
+p50                 6.712 ms            14.731 ms
+p95                 30.529 ms           35.329 ms
+p99                 44.689 ms           46.386 ms
+p999                62.118 ms           67.901 ms
+errors              0.000%              0.000%
+HTTP errors         0.000%              0.000%
+RSS after load      137.7 MB            N/A
+
+

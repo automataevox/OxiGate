@@ -4,10 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+mkdir -p benchmark/results
+
 echo "=== OxiGate vs HAProxy Benchmark ==="
 echo "Working directory: $ROOT"
 echo
 
+PROFILE="${1:-steady}" # Možnost předat profil jako parametr: ./run.sh overload
 BACKEND_PIDS=()
 OX_PID=""
 HAP_PID=""
@@ -19,9 +22,13 @@ HAP_RSS_AFTER="n/a"
 # ---------- helpers ----------
 cleanup() {
   echo "Cleaning up..."
-  if [[ -n "$OX_PID" ]]; then kill "$OX_PID" 2>/dev/null || true; fi
-  if [[ -n "$HAP_PID" ]]; then kill "$HAP_PID" 2>/dev/null || true; fi
-  for pid in "${BACKEND_PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  if [[ -n "$OX_PID" ]]; then kill -9 "$OX_PID" 2>/dev/null || true; fi
+  if [[ -n "$HAP_PID" ]]; then kill -9 "$HAP_PID" 2>/dev/null || true; fi
+  for pid in "${BACKEND_PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+  
+  # Ensure ports 8080, 8081-8083 are freed
+  fuser -k 8080/tcp 2>/dev/null || true
+  fuser -k 8081/tcp 8082/tcp 8083/tcp 2>/dev/null || true
   sleep 1
 }
 trap cleanup EXIT
@@ -38,12 +45,12 @@ start_backends() {
 
   for port in 8081 8082 8083; do
     for _ in {1..50}; do
-      if curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null; then
+      if curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null 2>&1; then
         break
       fi
       sleep 0.1
     done
-    if ! curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null; then
+    if ! curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null 2>&1; then
       echo "Benchmark backend failed to start on port ${port}"
       exit 1
     fi
@@ -62,15 +69,15 @@ measure_rss() {
 run_k6() {
   local name=$1
   local out="benchmark/results/${name}-summary.json"
-  echo "→ Running k6 against $name ..."
+  echo "→ Running k6 ($PROFILE profile) against $name ..."
   if command -v k6 >/dev/null 2>&1; then
-    k6 run --quiet --summary-export "$out" benchmark/k6-test.js | tee "benchmark/results/${name}-k6.txt"
+    k6 run --quiet -e PROFILE="$PROFILE" --summary-export "$out" benchmark/k6-test.js | tee "benchmark/results/${name}-k6.txt"
   else
-    echo "  k6 not found – falling back to hey (if available)"
+    echo "  k6 not found – falling back to hey"
     if command -v hey >/dev/null 2>&1; then
-      hey -z 30s -c 150 -q 0 http://127.0.0.1:8080/ | tee "benchmark/${name}-hey.txt"
+      hey -z 30s -c 150 -q 0 http://127.0.0.1:8080/ | tee "benchmark/results/${name}-hey.txt"
     else
-      echo "  Neither k6 nor hey found. Install one of them."
+      echo "  Neither k6 nor hey found. Aborting."
       return 1
     fi
   fi
@@ -80,7 +87,6 @@ run_k6() {
 cleanup
 start_backends
 
-# Ensure release binary exists
 if [[ ! -x target/release/oxigate ]]; then
   echo "Building OxiGate (release)..."
   cargo build --release
@@ -104,16 +110,10 @@ echo "  PID: $OX_PID  RSS: $OX_RSS_BEFORE"
 run_k6 "oxigate"
 OX_RSS_AFTER=$(measure_rss "$OX_PID")
 echo "  RSS after load: $OX_RSS_AFTER"
-printf '%s\n' "rss_before=$OX_RSS_BEFORE" "rss_after=$OX_RSS_AFTER" > benchmark/results/oxigate-rss.txt
 
-if ! kill -0 "$OX_PID" 2>/dev/null; then
-  echo "OxiGate exited during load"
-  cat benchmark/results/oxigate-run.log
-  exit 1
-fi
-
-kill -TERM $OX_PID 2>/dev/null || true
-wait $OX_PID 2>/dev/null || true
+kill -TERM "$OX_PID" 2>/dev/null || true
+wait "$OX_PID" 2>/dev/null || true
+OX_PID=""
 sleep 1
 
 # ---------- HAProxy ----------
@@ -121,24 +121,32 @@ echo
 echo ">>> Testing HAProxy"
 if ! command -v haproxy >/dev/null 2>&1; then
   echo "  HAProxy not installed – skipping comparison."
-  echo "  Install with: sudo apt install haproxy   or   brew install haproxy"
   exit 0
 fi
 
 rm -f benchmark/results/haproxy.pid
 haproxy -f benchmark/haproxy.cfg -p benchmark/results/haproxy.pid -D
 sleep 1
+
 HAP_PID=""
 if [[ -f benchmark/results/haproxy.pid ]]; then
   HAP_PID=$(cat benchmark/results/haproxy.pid)
 fi
+
+if [[ -z "$HAP_PID" ]] || ! kill -0 "$HAP_PID" 2>/dev/null; then
+  echo "HAProxy failed to start"
+  exit 1
+fi
+
 HAP_RSS_BEFORE=$(measure_rss "$HAP_PID")
 echo "  PID: $HAP_PID  RSS: $HAP_RSS_BEFORE"
 
 run_k6 "haproxy"
 HAP_RSS_AFTER=$(measure_rss "$HAP_PID")
 echo "  RSS after load: $HAP_RSS_AFTER"
-printf '%s\n' "rss_before=$HAP_RSS_BEFORE" "rss_after=$HAP_RSS_AFTER" > benchmark/results/haproxy-rss.txt
+
+kill -TERM "$HAP_PID" 2>/dev/null || true
+HAP_PID=""
 
 # ---------- comparison ----------
 if command -v jq >/dev/null 2>&1 \
