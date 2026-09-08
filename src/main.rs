@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use oxigate::config::Config;
 use oxigate::dashboard::{handle_admin, handle_dashboard_ws, DashboardState};
 use oxigate::health::{run_health_checks, HealthRuntime};

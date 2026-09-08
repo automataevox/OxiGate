@@ -29,6 +29,8 @@ rustls-pemfile = "2.2"
 webpki-roots = "0.26"
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "tls12"] }
 
+# RAM Optimalization
+tikv-jemallocator = "0.6"
 
 # Lock-free config swap
 arc-swap = "1.6"
