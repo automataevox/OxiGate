@@ -1,4 +1,4 @@
-use crate::config::{Config, LoadBalancingAlgorithm, RouteConfig};
+use crate::config::Config;
 use crate::lb::LoadBalancer;
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ impl Router {
         }
 
         // Longer prefixes first for more specific matches
-        routes.sort_by(|a, b| b.path_prefix.len().cmp(&a.path_prefix.len()));
+        routes.sort_by_key(|route| std::cmp::Reverse(route.path_prefix.len()));
 
         let default = if !config.upstreams.is_empty() {
             Some(Arc::new(LoadBalancer::from_config(config)))
@@ -85,7 +85,6 @@ fn path_matches(path: &str, prefix: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Config, LoadBalancingAlgorithm, RouteConfig, Upstream};
-    use std::net::SocketAddr;
 
     fn base_cfg() -> Config {
         Config {

@@ -12,12 +12,10 @@ use oxigate::security::Acl;
 use oxigate::state::AppState;
 use oxigate::tls;
 
-use bytes::Bytes;
 use clap::Parser;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::net::SocketAddr;
@@ -28,7 +26,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, warn, Instrument, Level};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -231,6 +229,8 @@ async fn main() -> anyhow::Result<()> {
     let metrics_accept = metrics.clone();
 
     loop {
+        while joins.try_join_next().is_some() {}
+
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -380,8 +380,9 @@ async fn serve_connection<I>(
                 http.target = %req.uri(),
                 client.address = %remote_addr,
             );
-            let _g = span.enter();
-            proxy_request(req, state, ctx, remote_addr).await
+            proxy_request(req, state, ctx, remote_addr)
+                .instrument(span)
+                .await
         }
     });
     let builder = AutoBuilder::new(TokioExecutor::new());

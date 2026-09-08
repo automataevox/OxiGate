@@ -56,17 +56,17 @@ export default function () {
 }
 
 export function handleSummary(data) {
-  const p50 = data.metrics.http_req_duration.values['p(50)'];
-  const p95 = data.metrics.http_req_duration.values['p(95)'];
-  const p99 = data.metrics.http_req_duration.values['p(99)'];
+  const p50 = data.metrics.http_req_duration.values['p(50)'] ?? null;
+  const p95 = data.metrics.http_req_duration.values['p(95)'] ?? null;
+  const p99 = data.metrics.http_req_duration.values['p(99)'] ?? null;
   const rps = data.metrics.http_reqs.values.rate;
   const failed = data.metrics.http_req_failed.values.rate;
 
   console.log('\n========== SUMMARY ==========');
   console.log(`Requests/s : ${rps.toFixed(1)}`);
-  console.log(`p50        : ${p50.toFixed(2)} ms`);
-  console.log(`p95        : ${p95.toFixed(2)} ms`);
-  console.log(`p99        : ${p99.toFixed(2)} ms`);
+  console.log(`p50        : ${p50 === null ? 'not recorded' : p50.toFixed(2) + ' ms'}`);
+  console.log(`p95        : ${p95 === null ? 'not recorded' : p95.toFixed(2) + ' ms'}`);
+  console.log(`p99        : ${p99 === null ? 'not recorded' : p99.toFixed(2) + ' ms'}`);
   console.log(`Error rate : ${(failed * 100).toFixed(3)} %`);
   console.log('=============================\n');
 

@@ -1,7 +1,7 @@
 //! Integration-style tests that do not require a full network stack.
 //! Full end-to-end proxy tests: see docs/PRODUCTION.md (run locally).
 
-use oxigate::config::{Config, LoadBalancingAlgorithm, Upstream};
+use oxigate::config::{LoadBalancingAlgorithm, Upstream};
 use oxigate::lb::LoadBalancer;
 use oxigate::ratelimit::{RateLimitConfig, RateLimiter};
 use oxigate::security::Acl;

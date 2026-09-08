@@ -1,1 +1,14 @@
 /target
+
+# Local benchmark output and generated backend builds
+/benchmark/results/*
+!/benchmark/results/.gitkeep
+/benchmark/backend/target/
+
+# Local TLS material
+/certs/*
+!/certs/.gitkeep
+
+# Local logs and editor files
+*.log
+.DS_Store

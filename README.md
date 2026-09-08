@@ -1,164 +1,117 @@
 # OxiGate
 
-**Ultra-fast, memory-safe Layer 7 HTTP/HTTPS Reverse Proxy & Load Balancer written in pure Rust.**
+OxiGate is a Rust and Tokio HTTP/1.1 and HTTP/2 reverse proxy and load balancer. It is designed for low overhead, explicit configuration, health-aware routing, and built-in observability.
 
-Designed as a modern cloud-native alternative to HAProxy and Nginx with focus on:
+This project is still under active development. Benchmark results are informative, not a claim of production parity with HAProxy.
 
-- Zero-downtime hot-reload (SIGHUP + ArcSwap)
-- Extremely low memory footprint
-- Native Prometheus observability
-- Multiple load-balancing algorithms
-- Active health checks
-- Memory safety (no GC, no buffer overflows)
+## Highlights
 
-## Quick start
+- HTTP/1.1 and HTTP/2 with Rustls TLS termination
+- Streaming request and response bodies with size and idle limits
+- Round-robin, weighted round-robin, least-connections, and P2C balancing
+- Path routing, cookie affinity, retries, ACLs, and rate limiting
+- Active health checks with configurable thresholds
+- WebSocket and HTTP Upgrade forwarding
+- Prometheus metrics, JSON access logs, and a live WebSocket dashboard
+- SIGHUP runtime reload and graceful shutdown
+
+## Quick Start
 
 ```bash
-# Build
 cargo build --release
-
-# Start test backends
-python3 -m http.server 8081 &
-python3 -m http.server 8082 &
-python3 -m http.server 8083 &
-
-# Run
 ./target/release/oxigate --config config.yaml
+```
 
-# Test
+Test the proxy and metrics endpoint:
+
+```bash
 curl http://127.0.0.1:8080/
+curl http://127.0.0.1:9090/healthz
 curl http://127.0.0.1:9090/metrics
 ```
 
-## Features
-
-| Feature                         | Status |
-|--------------------------------|--------|
-| HTTP/1.1 + HTTP/2 (ALPN)       | ✅     |
-| TLS termination (rustls)       | ✅     |
-| Streaming request/response     | ✅     |
-| Path-based routing             | ✅     |
-| Round-Robin / Weighted RR      | ✅     |
-| Least Connections / P2C        | ✅     |
-| Sticky sessions (cookie)       | ✅     |
-| Automatic retries              | ✅     |
-| Active health checks           | ✅     |
-| Global max connections         | ✅     |
-| Request timeout                | ✅     |
-| Header injection               | ✅     |
-| WebSocket / HTTP Upgrade       | ✅     |
-| Prometheus metrics             | ✅     |
-| JSON access logs               | ✅     |
-| SIGHUP zero-downtime reload    | ✅     |
-| Graceful shutdown              | ✅     |
-| Memory-safe (pure Rust)        | ✅     |
-
-## Configuration
-
-See `examples/config.full.yaml` or root `config.yaml`.
-
-```yaml
-listen: "0.0.0.0:8080"
-metrics_listen: "0.0.0.0:9090"
-
-upstreams:
-  - address: "http://127.0.0.1:8081"
-    weight: 1
-  - address: "http://127.0.0.1:8082"
-    weight: 1
-
-load_balancing: round_robin   # round_robin | weighted_round_robin | least_connections | power_of_two_choices
-
-health_check:
-  interval_secs: 5
-  path: "/"
-
-timeouts:
-  connect_secs: 5
-  request_secs: 30
-```
-
-## Testing & Benchmarks
-
-Full instructions are in **[test.md](test.md)**.
-
-Quick comparison against HAProxy:
+The root `config.yaml` expects backends on ports `8081`, `8082`, and `8083`. For a local smoke test, use the faster benchmark backend:
 
 ```bash
-# Install k6 and haproxy first
+cargo build --manifest-path benchmark/backend/Cargo.toml --release \
+  --target-dir target/benchmark-backend
+target/benchmark-backend/release/oxigate-benchmark-backend 8081 &
+```
+
+## Configuration and Operations
+
+Use [examples/config.full.yaml](examples/config.full.yaml) as the configuration reference. Set a strong `admin_token` and bind `metrics_listen` to a private address in production. `/healthz` remains public for liveness probes; `/dashboard`, `/api/stats`, and `/metrics` require the admin token when configured.
+
+Reload configuration and TLS material with:
+
+```bash
+kill -HUP $(pgrep -x oxigate)
+```
+
+Stop gracefully with `SIGTERM` or `SIGINT`. Raise the file descriptor limit for high concurrency:
+
+```bash
+ulimit -n 100000
+```
+
+## Dashboard and Metrics
+
+The admin listener exposes:
+
+| Endpoint | Purpose |
+|---|---|
+| `/dashboard` | Live dashboard using WebSocket updates |
+| `/ws` | JSON stats stream, one update per second |
+| `/api/stats` | JSON snapshot |
+| `/metrics` | Prometheus text format |
+| `/healthz` | Public liveness endpoint |
+
+Important metrics include `oxigate_requests_total`, `oxigate_request_duration_seconds`, `oxigate_upstream_health`, `oxigate_upstream_connections`, `oxigate_active_connections`, and `oxigate_retries_total`.
+
+## Benchmark
+
+Install `k6` and HAProxy, then run:
+
+```bash
 ./benchmark/run_benchmarks.sh
 ```
 
-## Production notes
+The script builds and starts three low-latency Rust backends, benchmarks OxiGate and HAProxy with the same k6 scenario, records RSS, writes aggregate summaries, updates `benchmark/results/comparison.txt`, and cleans up all processes and ports.
 
-- Always use `--release` build.
-- Increase file descriptor limit: `ulimit -n 100000`
-- Metrics are exposed on a separate port (default 9090).
-- Config reload: `kill -HUP $(pgrep oxigate)`
-- Graceful shutdown: SIGTERM / SIGINT
+The latest local one-minute run used the Rust backend and measured:
 
-## Project layout
+| Metric | OxiGate | HAProxy |
+|---|---:|---:|
+| Requests/s | 14,764.99 | 10,690.30 |
+| Median | 0.187 ms | 0.285 ms |
+| p95 | 0.558 ms | 0.878 ms |
+| HTTP errors | 0% | 0% |
+| RSS after load | 19.3 MB | 33.2 MB |
 
+Results depend on CPU, kernel, backend, k6 version, and configuration. Repeat the benchmark before drawing conclusions.
+
+## Docker
+
+The Compose stack uses [docker/oxigate-docker.yaml](docker/oxigate-docker.yaml), which routes to the Compose service names. Start it with:
+
+```bash
+cd docker
+docker compose up --build
 ```
-src/
-├── config/       # YAML config + validation
-├── lb/           # Load balancing algorithms
-├── metrics/      # Prometheus
-├── proxy/        # Core proxy logic
-├── health/       # Active health checks
-├── state.rs      # ArcSwap global state
-└── main.rs       # Entrypoint
+
+Do not use the example `admin_token: changeme` in an exposed deployment.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo check
+cargo test
+cargo build --release
 ```
+
+See [test.md](test.md) for functional checks and soak testing. GitHub Actions run from `.github/workflows/`.
 
 ## License
 
 MIT OR Apache-2.0
-
-
-## Monitoring
-
-OxiGate exposes a built-in admin surface on `metrics_listen` (default `:9090`):
-
-| Path | Purpose |
-|------|---------|
-| `/dashboard` | Live HTML dashboard |
-| `/api/stats` | JSON stats |
-| `/metrics` | Prometheus scrape |
-| `/healthz` | Liveness probe |
-
-```bash
-# Dashboard
-open http://127.0.0.1:9090/dashboard
-
-# Prometheus
-curl -s http://127.0.0.1:9090/metrics | head
-
-# Full stack (OxiGate + Prometheus + Grafana)
-cd docker && docker compose up --build
-# Grafana: http://localhost:3000  (admin/admin)
-```
-
-### Key Prometheus metrics
-
-- `oxigate_requests_total{method,status,upstream}`
-- `oxigate_request_duration_seconds`
-- `oxigate_upstream_health`
-- `oxigate_upstream_connections`
-- `oxigate_rate_limit_rejects_total`
-- `oxigate_rate_limit_allows_total`
-- `oxigate_active_connections`
-- `oxigate_retries_total`
-
-Tracing spans use the `tracing` crate (`proxy_request` span with `otel.kind`, `http.method`, `client.address`). Ship JSON logs to any OpenTelemetry collector / Loki / Elastic pipeline.
-
-## Rate limiting & PROXY protocol
-
-```yaml
-rate_limit:
-  rps: 1000
-  burst: 1.5
-
-proxy_protocol: false   # true only behind HAProxy/NLB sending PROXY v1/v2
-upstream_http2: true
-pool_max_idle_per_host: 64
-```

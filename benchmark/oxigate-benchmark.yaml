@@ -1,0 +1,35 @@
+listen: "0.0.0.0:8080"
+metrics_listen: "127.0.0.1:9090"
+
+upstreams:
+  - address: "http://127.0.0.1:8081"
+    weight: 1
+  - address: "http://127.0.0.1:8082"
+    weight: 1
+  - address: "http://127.0.0.1:8083"
+    weight: 1
+
+load_balancing: round_robin
+retries: 0
+max_connections: 0
+access_log: false
+upstream_http2: false
+pool_max_idle_per_host: 64
+sticky: null
+rate_limit: null
+health_check:
+  interval_secs: 5
+  timeout_secs: 2
+  path: "/"
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+timeouts:
+  connect_secs: 3
+  request_secs: 30
+  idle_secs: 60
+max_body_bytes: 16777216
+retry_idempotent_only: true
+force_retry_with_body: false
+proxy_protocol: false
+security_headers: false
+admin_token: ""

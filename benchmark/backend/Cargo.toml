@@ -1,0 +1,7 @@
+[package]
+name = "oxigate-benchmark-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "io-util"] }
