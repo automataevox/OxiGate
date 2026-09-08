@@ -15,7 +15,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 pub type ResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -35,9 +35,7 @@ pub struct ProxyContext {
     pub force_retry_with_body: bool,
     pub acl: Option<Acl>,
     pub security_headers: bool,
-    /// Whether the client connection is TLS-terminated by us.
     pub client_is_tls: bool,
-    /// Limits concurrent in-flight requests (HTTP/1.1 and HTTP/2 streams).
     pub request_limit: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     pub idle_timeout: Duration,
 }
@@ -54,7 +52,6 @@ pub async fn proxy_request(
     let query = req.uri().query().map(|q| q.to_string());
     let is_upgrade = is_upgrade_request(&req);
 
-    // Concurrent request / HTTP/2 stream limit (not just TCP accepts)
     let _request_permit = if let Some(ref sem) = ctx.request_limit {
         match sem.clone().try_acquire_owned() {
             Ok(p) => Some(p),
@@ -114,14 +111,12 @@ pub async fn proxy_request(
         .as_ref()
         .and_then(|s| extract_cookie(req.headers(), &s.cookie_name));
 
-    // Upgrade requests: stream without buffering; no retries (body is a tunnel).
     if is_upgrade {
         return Ok(proxy_upgrade(req, &lb, &ctx, remote_addr, start).await);
     }
 
     let (parts, body) = req.into_parts();
 
-    // Bound memory: enforce limit while streaming frames into a buffer for retry support.
     let body_bytes = match collect_limited(body, ctx.max_body_bytes, ctx.idle_timeout).await {
         Ok(b) => b,
         Err(BodyLimitError::TooLarge) => {
@@ -186,21 +181,21 @@ pub async fn proxy_request(
             .with_label_values(&[&upstream.address])
             .inc();
 
-        let result = attempt_proxy(
-            &parts,
-            body_bytes.clone(),
-            &upstream,
-            &ctx.client,
-            &method,
-            &path,
-            query.as_deref(),
+        let result = attempt_proxy(ProxyAttempt {
+            parts: &parts,
+            body_bytes: body_bytes.clone(),
+            upstream: &upstream,
+            client: &ctx.client,
+            method: &method,
+            path: &path,
+            query: query.as_deref(),
             remote_addr,
-            &ctx.headers,
-            ctx.request_timeout,
-            ctx.idle_timeout,
-            ctx.client_is_tls,
-            false,
-        )
+            headers_cfg: &ctx.headers,
+            request_timeout: ctx.request_timeout,
+            idle_timeout: ctx.idle_timeout,
+            client_is_tls: ctx.client_is_tls,
+            preserve_upgrade: false,
+        })
         .await;
 
         upstream.dec_connections();
@@ -263,7 +258,11 @@ pub async fn proxy_request(
         }
     }
 
-    error!(path = %path, error = %last_error.unwrap_or_else(|| "no upstreams".into()), "all attempts failed");
+    error!(
+        path = %path,
+        error = %last_error.unwrap_or_else(|| "no upstreams".into()),
+        "all attempts failed"
+    );
     ctx.metrics
         .requests_total
         .with_label_values(&[method.as_str(), "502", "none"])
@@ -287,28 +286,27 @@ async fn proxy_upgrade(
     };
 
     let (parts, body) = req.into_parts();
-    // For upgrades we stream the body without full buffer.
     let body_bytes = match collect_limited(body, ctx.max_body_bytes, ctx.idle_timeout).await {
         Ok(b) => b,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Bad Request"),
     };
 
     upstream.inc_connections();
-    let result = attempt_proxy(
-        &parts,
+    let result = attempt_proxy(ProxyAttempt {
+        parts: &parts,
         body_bytes,
-        &upstream,
-        &ctx.client,
-        &method,
-        &path,
-        query.as_deref(),
+        upstream: &upstream,
+        client: &ctx.client,
+        method: &method,
+        path: &path,
+        query: query.as_deref(),
         remote_addr,
-        &ctx.headers,
-        ctx.request_timeout,
-        ctx.idle_timeout,
-        ctx.client_is_tls,
-        true, // preserve upgrade headers
-    )
+        headers_cfg: &ctx.headers,
+        request_timeout: ctx.request_timeout,
+        idle_timeout: ctx.idle_timeout,
+        client_is_tls: ctx.client_is_tls,
+        preserve_upgrade: true,
+    })
     .await;
     upstream.dec_connections();
 
@@ -329,35 +327,36 @@ async fn proxy_upgrade(
     }
 }
 
-async fn attempt_proxy(
-    parts: &http::request::Parts,
+struct ProxyAttempt<'a> {
+    parts: &'a http::request::Parts,
     body_bytes: Bytes,
-    upstream: &UpstreamRuntime,
-    client: &HttpClient,
-    method: &hyper::Method,
-    path: &str,
-    query: Option<&str>,
+    upstream: &'a UpstreamRuntime,
+    client: &'a HttpClient,
+    method: &'a hyper::Method,
+    path: &'a str,
+    query: Option<&'a str>,
     remote_addr: SocketAddr,
-    headers_cfg: &HeaderConfig,
+    headers_cfg: &'a HeaderConfig,
     request_timeout: Duration,
     idle_timeout: Duration,
     client_is_tls: bool,
     preserve_upgrade: bool,
-) -> Result<Response<ResponseBody>, String> {
-    let target_uri = build_target_uri(&upstream.address, path, query)
+}
+
+async fn attempt_proxy(a: ProxyAttempt<'_>) -> Result<Response<ResponseBody>, String> {
+    let target_uri = build_target_uri(&a.upstream.address, a.path, a.query)
         .map_err(|e| format!("bad target uri: {e}"))?;
 
     let mut builder = Request::builder()
-        .method(method.clone())
+        .method(a.method.clone())
         .uri(target_uri)
-        .version(parts.version);
+        .version(a.parts.version);
 
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in a.parts.headers.iter() {
         if name == HOST {
             continue;
         }
-        if preserve_upgrade {
-            // Keep Connection / Upgrade for WebSocket
+        if a.preserve_upgrade {
             if is_hop_by_hop_except_upgrade(name) {
                 continue;
             }
@@ -367,32 +366,29 @@ async fn attempt_proxy(
         builder = builder.header(name, value);
     }
 
-    // Never trust inbound X-Forwarded-For alone; set from real socket / PROXY.
-    let client_ip = remote_addr.ip().to_string();
+    let client_ip = a.remote_addr.ip().to_string();
     builder = builder.header("X-Real-IP", &client_ip);
     builder = builder.header("X-Forwarded-For", &client_ip);
     builder = builder.header(
         "X-Forwarded-Proto",
-        if client_is_tls { "https" } else { "http" },
+        if a.client_is_tls { "https" } else { "http" },
     );
 
-    for (k, v) in &headers_cfg.request_set {
+    for (k, v) in &a.headers_cfg.request_set {
         builder = builder.header(k.as_str(), v.as_str());
     }
 
-    if let Some(host) = extract_host(&upstream.address) {
+    if let Some(host) = extract_host(&a.upstream.address) {
         if let Ok(hv) = HeaderValue::from_str(&host) {
             builder = builder.header(HOST, hv);
         }
     }
 
     let proxy_req = builder
-        .body(boxed_body(Full::new(body_bytes)))
+        .body(boxed_body(Full::new(a.body_bytes)))
         .map_err(|e| format!("build request: {e}"))?;
 
-    // Timeout until response headers (connect + TTFB). Body is then streamed;
-    // idle clients are still bounded by TCP keepalive / process-level drain on shutdown.
-    let response = tokio::time::timeout(request_timeout, client.request(proxy_req))
+    let response = tokio::time::timeout(a.request_timeout, a.client.request(proxy_req))
         .await
         .map_err(|_| "upstream request timed out".to_string())?
         .map_err(|e| format!("upstream error: {e}"))?;
@@ -404,7 +400,7 @@ async fn attempt_proxy(
         .version(resp_parts.version);
 
     for (name, value) in resp_parts.headers.iter() {
-        if preserve_upgrade {
+        if a.preserve_upgrade {
             if is_hop_by_hop_except_upgrade(name) {
                 continue;
             }
@@ -414,7 +410,7 @@ async fn attempt_proxy(
         resp_builder = resp_builder.header(name, value);
     }
 
-    let streamed = idle_wrap(resp_body, idle_timeout)
+    let streamed = idle_wrap(resp_body, a.idle_timeout)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         .boxed();
 
