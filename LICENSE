@@ -12,7 +12,7 @@ licensed under the GNU General Public License, Version 2 (GPL-2.0-only), or late
 unless explicitly stated otherwise in individual file headers.
 
 Exportable Headers & Extensibility Interfaces:
-All exportable API headers, include files, and C/Rust binding definitions intended
+All exportable API headers, include files, and Rust binding definitions intended
 for external module integration are licensed under the GNU Lesser General Public
 License, Version 2.1 (LGPL-2.1-only), or later.
 
@@ -21,14 +21,3 @@ binary-only, or proprietary modules using these headers without triggering the c
 requirements on the external module itself. However, any modifications or improvements
 to the core OxiGate codebase or LGPL header files must remain open source and be
 redistributed under their respective licenses upon request.
-
-OpenSSL Exception:
-Due to license incompatibilities between the GPL/LGPL and the OpenSSL license,
-OxiGate is released with the following explicit exception:
-
-  "Permission is hereby granted to compile, link, and/or execute OxiGate against
-   the OpenSSL toolkit (or modified versions thereof that use the same license as
-   OpenSSL), and to distribute the resulting executables under the terms of the
-   GPL/LGPL as applicable."
-
-The full license texts for GPL-2.0 and LGPL-2.1 are located in the "doc/" directory.

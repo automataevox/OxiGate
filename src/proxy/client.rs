@@ -7,7 +7,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
-pub type ClientBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+pub type ClientBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 pub type HttpClient = Client<HttpsConnector, ClientBody>;
@@ -56,7 +56,7 @@ pub fn build_client(opts: ClientOptions) -> HttpClient {
 pub fn boxed_body<B>(body: B) -> ClientBody
 where
     B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     body.map_err(Into::into).boxed()
 }

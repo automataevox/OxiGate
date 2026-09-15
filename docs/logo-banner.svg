@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 120" role="img" aria-label="OxiGate">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2EE6A6"/>
+      <stop offset="100%" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect width="480" height="120" rx="16" fill="#0B1220"/>
+  <!-- icon -->
+  <rect x="20" y="20" width="80" height="80" rx="20" fill="#0B1220" stroke="url(#g)" stroke-width="2.5"/>
+  <path d="M60 34 L78 45 L78 67 L60 78 L42 67 L42 45 Z"
+        fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/>
+  <circle cx="60" cy="56" r="10" fill="url(#g)"/>
+  <circle cx="60" cy="56" r="4" fill="#0B1220"/>
+  <!-- wordmark -->
+  <text x="120" y="72" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif"
+        font-size="42" font-weight="700" fill="#F8FAFC">OxiGate</text>
+  <text x="120" y="96" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif"
+        font-size="14" font-weight="500" fill="#94A3B8">Rust L7 reverse proxy</text>
+</svg>

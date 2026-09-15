@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="OxiGate">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2EE6A6"/>
+      <stop offset="100%" stop-color="#14B8A6"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0D9488"/>
+      <stop offset="100%" stop-color="#5EEAD4"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded square body -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#0B1220"/>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="none" stroke="url(#g)" stroke-width="3" opacity="0.9"/>
+  <!-- abstract gateway / ox mark: hexagon ring + node -->
+  <path d="M64 28 L94 46 L94 82 L64 100 L34 82 L34 46 Z"
+        fill="none" stroke="url(#g)" stroke-width="5" stroke-linejoin="round"/>
+  <circle cx="64" cy="64" r="14" fill="url(#g2)"/>
+  <circle cx="64" cy="64" r="6" fill="#0B1220"/>
+  <!-- small uplink dots -->
+  <circle cx="64" cy="38" r="4" fill="#5EEAD4"/>
+  <circle cx="88" cy="52" r="4" fill="#2EE6A6"/>
+  <circle cx="88" cy="76" r="4" fill="#2EE6A6"/>
+  <circle cx="64" cy="90" r="4" fill="#5EEAD4"/>
+  <circle cx="40" cy="76" r="4" fill="#2EE6A6"/>
+  <circle cx="40" cy="52" r="4" fill="#2EE6A6"/>
+</svg>

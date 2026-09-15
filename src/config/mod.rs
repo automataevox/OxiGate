@@ -9,9 +9,9 @@ pub mod validator;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub listen: SocketAddr,
-    #[serde(default = "default_metrics_listen")]
     pub metrics_listen: SocketAddr,
-
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
     /// Default upstream pool (used when no `routes` match, or as sole pool).
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
@@ -127,6 +127,7 @@ fn default_burst() -> f64 {
     1.5
 }
 
+#[allow(dead_code)]
 fn default_metrics_listen() -> SocketAddr {
     "0.0.0.0:9090".parse().unwrap()
 }

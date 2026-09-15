@@ -90,6 +90,7 @@ mod tests {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             metrics_listen: "127.0.0.1:0".parse().unwrap(),
+            max_concurrency: None,
             upstreams: vec![Upstream {
                 address: "http://127.0.0.1:8081".into(),
                 weight: 1,

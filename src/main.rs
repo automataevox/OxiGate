@@ -5,31 +5,35 @@ use oxigate::config::Config;
 use oxigate::dashboard::{handle_admin, handle_dashboard_ws, DashboardState};
 use oxigate::health::{run_health_checks, HealthRuntime};
 use oxigate::metrics::Metrics;
+use oxigate::pool::BufferPool;
 use oxigate::proxy::client::{build_client, ClientOptions};
 use oxigate::proxy::handler::ProxyContext;
-use oxigate::proxy::proxy_request;
 use oxigate::proxy_protocol;
 use oxigate::ratelimit::{RateLimitConfig, RateLimiter};
 use oxigate::router::Router;
 use oxigate::security::Acl;
 use oxigate::state::AppState;
 use oxigate::tls;
+use oxigate::BoxError;
 
+use anyhow::Result;
 use clap::Parser;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn, Instrument, Level};
+use tower::service_fn;
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -95,6 +99,46 @@ impl Runtime {
     }
 }
 
+/// Owned packet handed from accept loop → dispatcher.
+struct AcceptedConn {
+    stream: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+}
+
+/// Concrete owned service – avoids higher-rank lifetime issues with closures.
+#[derive(Clone)]
+struct ProxySvc {
+    ctx: Arc<ProxyContext>,
+    state: Arc<AppState>,
+    client_addr: SocketAddr,
+}
+
+impl tower::Service<Request<Incoming>> for ProxySvc {
+    type Response = hyper::Response<oxigate::DynResponseBody>;
+    type Error = BoxError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+        let ctx = self.ctx.clone();
+        let state = self.state.clone();
+        let client_addr = self.client_addr;
+        Box::pin(async move {
+            oxigate::proxy::proxy_request(req, state, ctx, client_addr)
+                .await
+                .map_err(|e| e as BoxError)
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
@@ -124,8 +168,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let metrics = Arc::new(Metrics::new()?);
-    let state = AppState::new(initial.clone());
+    let state = Arc::new(AppState::new(initial.clone()));
     let runtime = Arc::new(RwLock::new(Runtime::from_config(initial)?));
+
+    let shared_inflight = Arc::new(AtomicUsize::new(0));
 
     let admin_token = Arc::new(RwLock::new(
         runtime.read().unwrap().config.admin_token.clone(),
@@ -133,7 +179,6 @@ async fn main() -> anyhow::Result<()> {
     let shared_rl: Arc<RwLock<Option<Arc<RateLimiter>>>> =
         Arc::new(RwLock::new(runtime.read().unwrap().rate_limiter.clone()));
 
-    // Health runtime (client + config + lbs fully refreshable)
     let health_rt = {
         let runtime = runtime.clone();
         let (client, config) = {
@@ -175,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // SIGHUP full rebuild + refresh health/admin shared state
+    // SIGHUP reload
     {
         let state = state.clone();
         let runtime = runtime.clone();
@@ -200,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                             state.swap_config(cfg);
                             *runtime.write().unwrap() = new_rt;
-                            info!("runtime reloaded (router/client/TLS/rate-limit/health/admin)");
+                            info!("runtime reloaded");
                         }
                         Err(e) => error!("runtime rebuild failed: {e}"),
                     },
@@ -227,41 +272,66 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     info!(%listen_addr, "listening");
 
-    let mut shutdown_rx = shutdown_rx.clone();
-    let mut joins = JoinSet::new();
-    let metrics_accept = metrics.clone();
+    // ---- Bounded task channel + pre-allocated buffer pool ----
+    let max_conn = {
+        let rt = runtime.read().unwrap();
+        if rt.config.max_connections > 0 {
+            rt.config.max_connections
+        } else {
+            rt.config.max_concurrency.unwrap_or(10_000)
+        }
+    };
+    let channel_cap = max_conn.max(256);
+    let conn_limit = Arc::new(Semaphore::new(max_conn.max(64)));
 
-    loop {
-        while joins.try_join_next().is_some() {}
+    let buffer_pool = BufferPool::new(
+        (max_conn * 2).clamp(256, 16_384),
+        16 * 1024,
+    );
+    info!(
+        channel_cap,
+        max_conn,
+        pool_size = buffer_pool.capacity(),
+        "bounded task channel + buffer pool ready"
+    );
 
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("draining {} connection task(s)", joins.len());
-                    let deadline = tokio::time::sleep(Duration::from_secs(15));
-                    tokio::pin!(deadline);
-                    loop {
-                        tokio::select! {
-                            _ = &mut deadline => {
-                                warn!("drain timeout – aborting remaining tasks");
-                                joins.abort_all();
-                                break;
-                            }
-                            r = joins.join_next() => {
-                                if r.is_none() { break; }
-                            }
-                        }
+    let (conn_tx, mut conn_rx) = mpsc::channel::<AcceptedConn>(channel_cap);
+
+    // Dispatcher: pulls from bounded channel, spawns connection task only when
+    // a Semaphore permit is free. Caps concurrent connection tasks at max_conn.
+    {
+        let runtime = runtime.clone();
+        let state = state.clone();
+        let metrics = metrics.clone();
+        let shared_inflight = shared_inflight.clone();
+        let buffer_pool = buffer_pool.clone();
+        let conn_limit = conn_limit.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { break; }
+                        continue;
                     }
-                    info!("shutdown complete");
-                    break;
-                }
-            }
-            accept = listener.accept() => {
-                let (stream, remote_addr) = match accept {
-                    Ok(v) => v,
-                    Err(e) => { warn!("accept: {e}"); continue; }
+                    item = conn_rx.recv() => item,
                 };
-                let _ = stream.set_nodelay(true);
+                let Some(AcceptedConn { stream, remote_addr }) = accepted else {
+                    break;
+                };
+
+                let permit = match conn_limit.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        metrics
+                            .requests_total
+                            .with_label_values(&["ACCEPT", "503", "none"])
+                            .inc();
+                        tracing::debug!(%remote_addr, "connection limit – shedding");
+                        continue;
+                    }
+                };
 
                 let (router, client, rate_limiter, tls_acc, request_limit, proxy_trusted, cfg) = {
                     let rt = runtime.read().unwrap();
@@ -277,86 +347,68 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let state = state.clone();
-                let metrics = metrics_accept.clone();
+                let metrics = metrics.clone();
+                let shared_inflight = shared_inflight.clone();
+                let buffer_pool = buffer_pool.clone();
                 metrics.active_connections.inc();
-                let idle = Duration::from_secs(cfg.timeouts.idle_secs.max(1));
-                let req_timeout = cfg.request_timeout();
 
-                joins.spawn(async move {
-
-                    let (client_addr, stream) = if cfg.proxy_protocol {
-                        let allowed = match &proxy_trusted {
-                            Some(acl) => acl.is_allowed(remote_addr.ip()),
-                            None => true,
-                        };
-                        if !allowed {
-                            warn!(%remote_addr, "PROXY from untrusted source rejected");
-                            metrics.active_connections.dec();
-                            return;
-                        }
-                        match proxy_protocol::maybe_read_proxy_header(stream).await {
-                            Ok((Some(h), s)) => (h.src, s),
-                            Ok((None, s)) => (remote_addr, s),
-                            Err(e) => {
-                                warn!(%remote_addr, error=%e, "PROXY parse failed");
-                                metrics.active_connections.dec();
-                                return;
-                            }
-                        }
-                    } else {
-                        (remote_addr, proxy_protocol::PrefixedStream::new(stream, Vec::new()))
-                    };
-
-                    let acl = cfg
-                        .acl
-                        .as_ref()
-                        .and_then(|a| Acl::from_config(&a.allow, &a.deny).ok());
-
-                    let make_ctx = |is_tls: bool| {
-                        Arc::new(ProxyContext {
-                            router: router.clone(),
-                            client: client.clone(),
-                            metrics: metrics.clone(),
-                            retries: cfg.retries,
-                            request_timeout: req_timeout,
-                            sticky: cfg.sticky.clone(),
-                            headers: cfg.headers.clone(),
-                            access_log: cfg.access_log,
-                            rate_limiter: rate_limiter.clone(),
-                            max_body_bytes: cfg.max_body_bytes,
-                            retry_idempotent_only: cfg.retry_idempotent_only,
-                            force_retry_with_body: cfg.force_retry_with_body,
-                            acl: acl.clone(),
-                            security_headers: cfg.security_headers,
-                            client_is_tls: is_tls,
-                            request_limit: request_limit.clone(),
-                            idle_timeout: idle,
-                        })
-                    };
-
-                    // Safety net for abandoned TCP connections (primary idle is on body frames).
-                    let max_conn_life = idle.saturating_mul(10).max(req_timeout.saturating_mul(2));
-                    let result = tokio::time::timeout(max_conn_life, async {
-                        if let Some(acceptor) = tls_acc {
-                            match acceptor.accept(stream).await {
-                                Ok(tls_stream) => {
-                                    let io = TokioIo::new(tls_stream);
-                                    serve_connection(io, state, make_ctx(true), client_addr).await;
-                                }
-                                Err(e) => tracing::debug!(%client_addr, "TLS failed: {e}"),
-                            }
-                        } else {
-                            let io = TokioIo::new(stream);
-                            serve_connection(io, state, make_ctx(false), client_addr).await;
-                        }
-                    })
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = handle_one_connection(
+                        stream,
+                        remote_addr,
+                        router,
+                        client,
+                        rate_limiter,
+                        tls_acc,
+                        request_limit,
+                        proxy_trusted,
+                        cfg,
+                        state,
+                        metrics.clone(),
+                        shared_inflight,
+                        buffer_pool,
+                    )
                     .await;
-
-                    if result.is_err() {
-                        warn!(%client_addr, "connection idle/lifetime timeout");
-                    }
                     metrics.active_connections.dec();
                 });
+            }
+            tracing::debug!("connection dispatcher exited");
+        });
+    }
+
+    let mut shutdown_rx = shutdown_rx.clone();
+    let metrics_accept = metrics.clone();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("shutdown: closing accept channel");
+                    drop(conn_tx);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    info!("shutdown complete");
+                    break;
+                }
+            }
+            accept = listener.accept() => {
+                let (stream, remote_addr) = match accept {
+                    Ok(v) => v,
+                    Err(e) => { warn!("accept: {e}"); continue; }
+                };
+                let _ = stream.set_nodelay(true);
+
+                match conn_tx.try_send(AcceptedConn { stream, remote_addr }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        metrics_accept
+                            .requests_total
+                            .with_label_values(&["ACCEPT", "503", "none"])
+                            .inc();
+                        tracing::debug!(%remote_addr, "accept queue full – shedding");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
             }
         }
     }
@@ -364,73 +416,168 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve_connection<I>(
-    io: TokioIo<I>,
-    state: AppState,
-    ctx: Arc<ProxyContext>,
+async fn handle_one_connection(
+    stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-) where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let service = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
-        let ctx = ctx.clone();
-        async move {
-            let span = tracing::info_span!(
-                "proxy_request",
-                otel.kind = "server",
-                http.method = %req.method(),
-                http.target = %req.uri(),
-                client.address = %remote_addr,
-            );
-            proxy_request(req, state, ctx, remote_addr)
-                .instrument(span)
-                .await
+    router: Arc<Router>,
+    client: oxigate::proxy::client::HttpClient,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    tls_acc: Option<TlsAcceptor>,
+    request_limit: Option<Arc<Semaphore>>,
+    proxy_trusted: Option<Acl>,
+    cfg: Config,
+    state: Arc<AppState>,
+    metrics: Arc<Metrics>,
+    _shared_inflight: Arc<AtomicUsize>,
+    _buffer_pool: BufferPool,
+) -> Result<(), BoxError> {
+    let (client_addr, stream) = if cfg.proxy_protocol {
+        let allowed = match &proxy_trusted {
+            Some(acl) => acl.is_allowed(remote_addr.ip()),
+            None => true,
+        };
+        if !allowed {
+            warn!(%remote_addr, "PROXY from untrusted source rejected");
+            return Ok(());
         }
+        match proxy_protocol::maybe_read_proxy_header(stream).await {
+            Ok((Some(h), s)) => (h.src, s),
+            Ok((None, s)) => (remote_addr, s),
+            Err(e) => {
+                warn!(%remote_addr, error=%e, "PROXY parse failed");
+                return Ok(());
+            }
+        }
+    } else {
+        (remote_addr, proxy_protocol::PrefixedStream::new(stream, Vec::new()))
+    };
+
+    let acl = cfg
+        .acl
+        .as_ref()
+        .and_then(|a| Acl::from_config(&a.allow, &a.deny).ok());
+
+    let idle = Duration::from_secs(cfg.timeouts.idle_secs.max(1));
+    let req_timeout = cfg.request_timeout();
+
+    let ctx = Arc::new(ProxyContext {
+        router,
+        client,
+        metrics: metrics.clone(),
+        retries: cfg.retries,
+        request_timeout: req_timeout,
+        sticky: cfg.sticky.clone(),
+        headers: cfg.headers.clone(),
+        access_log: cfg.access_log,
+        rate_limiter,
+        max_body_bytes: cfg.max_body_bytes,
+        retry_idempotent_only: cfg.retry_idempotent_only,
+        force_retry_with_body: cfg.force_retry_with_body,
+        acl,
+        security_headers: cfg.security_headers,
+        client_is_tls: tls_acc.is_some(),
+        request_limit,
+        idle_timeout: idle,
     });
-    let builder = AutoBuilder::new(TokioExecutor::new());
-    if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
-        tracing::debug!(%remote_addr, "conn closed: {e}");
+
+    let max_conn_life = idle.saturating_mul(10).max(req_timeout.saturating_mul(2));
+    let result = tokio::time::timeout(max_conn_life, async {
+        if let Some(acceptor) = tls_acc {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    let io = TokioIo::new(tls_stream);
+                    let mut ctx = (*ctx).clone();
+                    ctx.client_is_tls = true;
+                    let svc = ProxySvc {
+                        ctx: Arc::new(ctx),
+                        state: state.clone(),
+                        client_addr,
+                    };
+                    let service = TowerToHyperService::new(svc);
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
+                        tracing::debug!(%client_addr, "TLS conn closed: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!(%client_addr, "TLS failed: {e}"),
+            }
+        } else {
+            let io = TokioIo::new(stream);
+            let svc = ProxySvc {
+                ctx,
+                state,
+                client_addr,
+            };
+            let service = TowerToHyperService::new(svc);
+            let builder = auto::Builder::new(TokioExecutor::new());
+            if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
+                tracing::debug!(%client_addr, "HTTP conn closed: {e}");
+            }
+        }
+    })
+    .await;
+
+    if result.is_err() {
+        warn!(%client_addr, "connection idle/lifetime timeout");
     }
+    Ok(())
 }
 
 async fn run_admin_server(
     addr: SocketAddr,
     state: Arc<DashboardState>,
     shutdown_rx: &mut watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "admin/metrics listening");
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() { break; }
+                if *shutdown_rx.borrow() {
+                    break;
+                }
             }
             accept = listener.accept() => {
                 let (stream, _) = accept?;
                 let io = TokioIo::new(stream);
                 let state = state.clone();
+
                 tokio::spawn(async move {
+                    use std::convert::Infallible;
+
                     let service = service_fn(move |req: Request<Incoming>| {
                         let state = state.clone();
                         async move {
                             if req.uri().path() == "/ws"
                                 && req.headers().contains_key(hyper::header::UPGRADE)
                             {
-                                Ok(handle_dashboard_ws(req, state))
+                                let res = handle_dashboard_ws(req, state);
+                                Ok::<_, Infallible>(res.map(|b| {
+                                    b.map_err(|e: std::convert::Infallible| -> BoxError { match e {} }).boxed()
+                                }))
                             } else {
-                                handle_admin(req, state).await
+                                match handle_admin(req, state).await {
+                                    Ok(res) => {
+                                        Ok(res.map(|b| {
+                                            b.map_err(|e: std::convert::Infallible| -> BoxError { match e {} }).boxed()
+                                        }))
+                                    }
+                                    Err(_e) => unreachable!(),
+                                }
                             }
                         }
                     });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(io, service)
-                        .with_upgrades()
-                        .await;
+                    let hyper_service = TowerToHyperService::new(service);
+
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    if let Err(e) = builder.serve_connection_with_upgrades(io, hyper_service).await {
+                        tracing::debug!("admin conn closed: {e}");
+                    }
                 });
             }
         }
     }
+
     Ok(())
 }

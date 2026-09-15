@@ -13,7 +13,7 @@ const profiles = {
       executor: 'constant-arrival-rate',
       rate: 40000,
       timeUnit: '1s',
-      duration: '45s',
+      duration: '60s',
       preAllocatedVUs: 200,
       maxVUs: 1000,
     },
@@ -24,8 +24,8 @@ const profiles = {
       rate: 4000,
       timeUnit: '1s',
       duration: '45s',
-      preAllocatedVUs: 200,
-      maxVUs: 1000,
+      preAllocatedVUs: 3000,
+      maxVUs: 6000,
     },
   },
   overload: {
@@ -34,8 +34,8 @@ const profiles = {
       rate: 75000,
       timeUnit: '1s',
       duration: '60s',
-      preAllocatedVUs: 1000,
-      maxVUs: 4000,
+      preAllocatedVUs: 3000,
+      maxVUs: 6000,
     },
   },
   stress: {
@@ -44,23 +44,20 @@ const profiles = {
       startVUs: 50,
       stages: [
         { duration: '20s', target: 500 },
-        { duration: '40s', target: 2000 },
+        { duration: '40s', target: 4000 },
         { duration: '15s', target: 0 },
       ],
     },
   },
   soak_4h: {
-    executor: 'ramping-arrival-rate',
-    startRate: 10000,
-    timeUnit: '1s',
-    preAllocatedVUs: 1000,
-    maxVUs: 3000,
-    stages: [
-      { duration: '5m', target: 50000 },   // Warm-up to 50k RPS
-      { duration: '3h45m', target: 50000 },// Hold 50k RPS steady for ~3.75 hours
-      { duration: '5m', target: 80000 },   // Burst stress to cap out before finish
-      { duration: '5m', target: 0 },       // Cooldown to check RAM release
-    ],
+    soak_4h: {
+      executor: 'constant-arrival-rate',
+      rate: 40000,
+      timeUnit: '1s',
+      duration: '4h',
+      preAllocatedVUs: 300,
+      maxVUs: 600,   // hard cap — raise only if RPS can't be met
+    },
   },
 };
 

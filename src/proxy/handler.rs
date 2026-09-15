@@ -5,19 +5,23 @@ use crate::proxy::body_limit::{collect_limited, idle_wrap, BodyLimitError};
 use crate::proxy::client::{boxed_body, HttpClient};
 use crate::router::Router;
 use crate::security::Acl;
+use crate::state::AppState;
+use crate::{BoxError, DynResponseBody};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONNECTION, HOST, SET_COOKIE, UPGRADE};
+use hyper::upgrade::on;
 use hyper::{Request, Response, StatusCode, Uri};
-use std::convert::Infallible;
+use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::copy_bidirectional;
 use tracing::{error, info, warn};
 
-pub type ResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+pub type ResponseBody = BoxBody<Bytes, BoxError>;
 
 #[derive(Clone)]
 pub struct ProxyContext {
@@ -42,10 +46,10 @@ pub struct ProxyContext {
 
 pub async fn proxy_request(
     req: Request<Incoming>,
-    _state: crate::state::AppState,
+    _state: Arc<AppState>,
     ctx: Arc<ProxyContext>,
     remote_addr: SocketAddr,
-) -> Result<Response<ResponseBody>, Infallible> {
+) -> Result<Response<DynResponseBody>, BoxError> {
     let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -271,7 +275,7 @@ pub async fn proxy_request(
 }
 
 async fn proxy_upgrade(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     lb: &LoadBalancer,
     ctx: &ProxyContext,
     remote_addr: SocketAddr,
@@ -280,21 +284,19 @@ async fn proxy_upgrade(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
+
     let upstream = match lb.select() {
         Some(u) => u,
         None => return error_response(StatusCode::SERVICE_UNAVAILABLE, "No healthy upstreams"),
     };
 
-    let (parts, body) = req.into_parts();
-    let body_bytes = match collect_limited(body, ctx.max_body_bytes, ctx.idle_timeout).await {
-        Ok(b) => b,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Bad Request"),
-    };
+    let client_upgrade_fut = on(&mut req);
+    let (parts, _body) = req.into_parts();
 
     upstream.inc_connections();
     let result = attempt_proxy(ProxyAttempt {
         parts: &parts,
-        body_bytes,
+        body_bytes: Bytes::new(),
         upstream: &upstream,
         client: &ctx.client,
         method: &method,
@@ -311,7 +313,7 @@ async fn proxy_upgrade(
     upstream.dec_connections();
 
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let duration = start.elapsed().as_secs_f64();
             ctx.metrics
                 .requests_total
@@ -321,6 +323,27 @@ async fn proxy_upgrade(
                 .request_duration
                 .with_label_values(&[&upstream.address])
                 .observe(duration);
+
+            if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                let upstream_upgrade_fut = on(&mut resp);
+
+                tokio::spawn(async move {
+                    match tokio::try_join!(client_upgrade_fut, upstream_upgrade_fut) {
+                        Ok((client_upgraded, upstream_upgraded)) => {
+                            let mut client_io = TokioIo::new(client_upgraded);
+                            let mut upstream_io = TokioIo::new(upstream_upgraded);
+
+                            if let Err(err) = copy_bidirectional(&mut client_io, &mut upstream_io).await {
+                                tracing::debug!("Upgrade stream closed: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("Upgrade handshake failed: {err}");
+                        }
+                    }
+                });
+            }
+
             resp
         }
         Err(_) => error_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
@@ -411,7 +434,7 @@ async fn attempt_proxy(a: ProxyAttempt<'_>) -> Result<Response<ResponseBody>, St
     }
 
     let streamed = idle_wrap(resp_body, a.idle_timeout)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .map_err(|e| Box::new(e) as BoxError)
         .boxed();
 
     resp_builder
@@ -446,7 +469,7 @@ fn build_target_uri(
     upstream_base: &str,
     path: &str,
     query: Option<&str>,
-) -> Result<Uri, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Uri, BoxError> {
     let base = upstream_base.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
     let full = match query {
@@ -491,8 +514,9 @@ fn is_hop_by_hop_except_upgrade(name: &HeaderName) -> bool {
 
 fn error_response(status: StatusCode, msg: &'static str) -> Response<ResponseBody> {
     let body = Full::new(Bytes::from(msg))
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .map_err(|e: std::convert::Infallible| -> BoxError { match e {} })
         .boxed();
+
     Response::builder()
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")

@@ -10,7 +10,7 @@ upstreams:
     weight: 1
 
 load_balancing: round_robin
-retries: 0
+retries: 1
 max_connections: 0
 access_log: false
 upstream_http2: false
@@ -18,7 +18,7 @@ pool_max_idle_per_host: 64
 sticky: null
 rate_limit: null
 health_check:
-  interval_secs: 5
+  interval_secs: 2
   timeout_secs: 2
   path: "/"
   unhealthy_threshold: 3
